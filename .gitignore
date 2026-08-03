@@ -1,0 +1,30 @@
+# Local config — contains your Dexcom password and Hue key. Never commit.
+diabetes_light.env
+*.env
+!*.env.example
+
+# Virtualenvs
+venv/
+.venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.mypy_cache/
+.ruff_cache/
+
+# Logs
+*.log
+out.log
+err.log
+
+# Backups from the update procedure
+*.bak
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

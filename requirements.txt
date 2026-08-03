@@ -1,0 +1,5 @@
+# pydexcom talks to the Dexcom Share API. Its constructor changed at 0.4.1
+# (ous -> region); the script handles both, so no floor is enforced here.
+# 0.4.1+ needs Python 3.9+, which is why pip may stop at 0.4.0 on older setups.
+pydexcom
+requests>=2.25

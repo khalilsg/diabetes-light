@@ -1,0 +1,30 @@
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -r requirements.txt
+      - name: Compile
+        run: python -m py_compile diabetes_light.py
+      # --preview needs no credentials and no bridge, so it works in CI and
+      # catches broken colour stops or brightness maths.
+      - name: Preview default palette
+        run: python diabetes_light.py --preview
+      - name: Reject an invalid palette
+        run: |
+          if COLOR_STOPS='[[80,"nope"]]' python diabetes_light.py --preview; then
+            echo "Expected a failure on an invalid hex colour"; exit 1
+          fi
