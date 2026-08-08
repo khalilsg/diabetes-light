@@ -1,8 +1,9 @@
 # diabetes-light
 
 An ambient light that tracks a Dexcom G7 continuous glucose monitor. Colour
-shows the reading, brightness shows how fresh it is, and the light goes dark
-whenever there's nothing trustworthy to show.
+shows the reading — nudged by the trend arrow toward where it's heading —
+brightness shows how fresh it is, and the light goes dark whenever there's
+nothing trustworthy to show.
 
 Runs as a small Python service on any always-on machine, talking to Philips Hue
 bulbs over your LAN.
@@ -173,7 +174,7 @@ HUE_BRIDGE_IP=192.168.1.50
 HUE_APP_KEY=...
 HUE_LIGHT_IDS=...          # one id, or several separated by commas
 
-# Optional — see sections 5a and 5b below
+# Optional — see sections 5a, 5b and 5c below
 MAX_BRIGHTNESS=70
 MIN_BRIGHTNESS=10
 FRESH_MINUTES=6
@@ -286,9 +287,11 @@ Just use mmol values in the stops. Here's the same default palette converted:
 COLOR_STOPS=[[3.1,"#FF00A8"],[3.9,"#FF0033"],[5.0,"#FF4D00"],[6.4,"#FF9500"],[8.0,"#FFC400"],[9.7,"#FFE0A0"],[11.1,"#FFFFFF"],[13.9,"#00D0FF"]]
 ```
 
-Two other things need converting with it:
+Three other things need converting with it:
 
 - `URGENT_BELOW=3.9` — it's a glucose reading too, and defaults to the mg/dL 70.
+- `TREND_OFFSETS` — those are readings' worth of shift, so the default 5 / 10 /
+  15 becomes roughly 0.3 / 0.6 / 0.8. See section 5c.
 - `reading.value` becomes `reading.mmol_l` in the script. That's the one place
   the units are actually baked in.
 
@@ -394,6 +397,114 @@ below `WATCHDOG_MINUTES` — see section 8.
 
 `FRESH_SECONDS` and `STALE_SECONDS` were the old names. If either is still in
 your env file the script stops with a message telling you what to rename.
+
+## 5c. Trend adjustment
+
+Every reading arrives with a Dexcom trend arrow. Before the colour and the
+brightness level are picked, the reading is shifted by that arrow — so a 145
+sitting flat stays gold, while a 145 falling fast is drawn as 130 and leans
+further toward orange.
+
+The defaults live at the top of `diabetes_light.py`:
+
+```python
+TREND_OFFSETS = {
+    "DoubleUp":       15,   # ↑↑  rising quickly
+    "SingleUp":       10,   # ↑   rising
+    "FortyFiveUp":     5,   # ↗   rising slightly
+    "Flat":            0,   # →   steady
+    "FortyFiveDown":  -5,   # ↘   falling slightly
+    "SingleDown":    -10,   # ↓   falling
+    "DoubleDown":    -15,   # ↓↓  falling quickly
+}
+```
+
+The idea is that a glance at the light is worth a little more if it accounts for
+direction. A reading is already five minutes old by the time it reaches the
+bulb, and one that's moving has kept moving since.
+
+### What it does and doesn't touch
+
+It moves **the number the light is drawn from** — the colour, and the
+`URGENT_BELOW` comparison that decides whether to jump to full brightness.
+
+It does **not** touch freshness. The fade, `STALE_MINUTES` and the watchdog all
+still work off the real reading and its real timestamp, so a trend arrow can
+never make old data look fresh, and can never keep the light on past the point
+where it would otherwise go dark.
+
+### The trade-off
+
+**A falling arrow can put the light at `URGENT_LEVEL` for a reading that is
+still in range.** With the defaults, a 78 falling quickly is drawn as 63 —
+magenta, full brightness — even though 78 is fine right now. That's the feature
+working as intended: the arrow says you won't be at 78 for long. But it does
+mean the light is showing a projection rather than a measurement.
+
+If you'd rather the light only ever showed the number Dexcom actually sent,
+turn it off:
+
+```
+TREND_ADJUST=0
+```
+
+Smaller offsets are the middle ground — `5 / 3 / 2` keeps a nudge of direction
+without moving readings across the urgent threshold.
+
+The per-cycle log always prints the real reading first, then the shift, so
+you can see both:
+
+```
+Glucose 78 ↓↓ -15 -> 63 | 180s old | #FF006A | 100%  URGENT LOW
+```
+
+### In the env file
+
+As with the palette, better set here than edited into the script:
+
+```
+TREND_ADJUST=1
+TREND_OFFSETS={"DoubleUp":15,"SingleUp":10,"FortyFiveUp":5,"Flat":0,"FortyFiveDown":-5,"SingleDown":-10,"DoubleDown":-15}
+```
+
+One line, JSON, double quotes. That's the default written out — a starting point
+to edit rather than something to retype. Names are Dexcom's own and matched
+loosely, so `SingleUp`, `single_up` and `SINGLEUP` are the same key, and the two
+awkward ones can be written `45up` and `45down`. Any name that isn't one of the
+seven stops the script at startup with the list of valid ones. Arrows the script
+can't identify — `?`, `-`, or no arrow at all — get no adjustment.
+
+You don't have to list all seven. Anything you leave out is treated as 0:
+
+```
+TREND_OFFSETS={"DoubleDown":-20,"SingleDown":-10}
+```
+
+That one adjusts for falls only, on the argument that a rise gives you more time
+to react than a fall does.
+
+**The offsets are in the same units as your colour stops** — mg/dL by default.
+On mmol/L you want something like `{"DoubleUp":0.8,"SingleUp":0.6,"FortyFiveUp":0.3,"FortyFiveDown":-0.3,"SingleDown":-0.6,"DoubleDown":-0.8}`.
+
+### Preview it
+
+```bash
+python diabetes_light.py --preview
+```
+
+Prints what each arrow does to a mid-range reading, and the colour that comes
+out:
+
+```
+Trend adjustment, shown against a reading of 145:
+  ↑↑  DoubleUp          +15  ->     160  #FFCE50
+  ↑   SingleUp          +10  ->     155  #FFCA35
+  ↗   FortyFiveUp        +5  ->     150  #FFC71B
+  →   Flat                0  ->     145  #FFC400
+  ↘   FortyFiveDown      -5  ->     140  #FFBC00
+  ↓   SingleDown        -10  ->     135  #FFB400
+  ↓↓  DoubleDown        -15  ->     130  #FFAC00
+```
 
 ## 6. Test it
 
@@ -631,6 +742,9 @@ A new script overwrites it. Before updating, move your palette into
 `diabetes_light.env` as a JSON `COLOR_STOPS` line (see 5a) — it takes precedence
 over the table in the code, and then updates can never clobber it again.
 
+The same goes for `TREND_OFFSETS` (see 5c), and for anything else you've changed
+at the top of the file.
+
 ### Expect the watchdog to fire
 
 The bridge timer keeps counting during the update. If you take more than 15
@@ -784,12 +898,13 @@ tail -20 out.log
 You want a recent `Glucose NNN` line. Each update logs what it calculated:
 
 ```
-Glucose 62 ↓ | 45s old | #FF001F | 100%  URGENT LOW
+Glucose 62 ↓ -10 -> 52 | 45s old | #FF00A8 | 100%  URGENT LOW
 Glucose 143 → | 90s old | #FFC200 | 70%
-Glucose 118 → | 400s old [repeat] | #FF9B00 | 52%
+Glucose 118 ↗ +5 -> 123 | 400s old [repeat] | #FFA200 | 52%
 ```
 
-Reading, trend, age, the exact hex colour and brightness sent to the bridge, and
+Reading, trend, the trend adjustment when there is one (section 5c), age, the
+exact hex colour and brightness sent to the bridge, and
 `[repeat]` when Share handed back a reading it had already given us. If the light
 looks wrong, this line tells you whether the script computed the wrong colour or
 the bridge ignored a correct one. A service that's up but restart-looping
@@ -819,6 +934,7 @@ not.
 | Cream → white | Getting high (175-200) |
 | Cyan | Urgent high (250 and above) |
 | Full brightness, no fade | Reading at or below `URGENT_BELOW` |
+| A colour a little ahead of your phone | The trend arrow shifts the reading before the colour is picked — see 5c |
 | Dimming | Data is getting old (past 6 min), fading 70% -> 10% |
 | Off | No reading you can trust — stale data, stopped readings, or the script itself is gone |
 

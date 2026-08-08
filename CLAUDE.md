@@ -50,6 +50,13 @@ flicker. `Config` warns when the gap drops under two poll intervals.
 last reading forever after a sensor session ends. `Runner.last_stamp` guards
 this. Re-arming the watchdog on repeat data would defeat the entire mechanism.
 
+**The trend offset moves the number, not the clock.** `TREND_OFFSETS` shifts the
+reading before colour and level are picked — including the `URGENT_BELOW`
+comparison, so a falling arrow can trigger urgent brightness on an in-range
+reading. It must never touch the fade, `STALE_MINUTES` or the watchdog: those
+work off the real reading's real timestamp, or an arrow could make old data look
+fresh. The log line prints the real reading first, then the shift.
+
 **Staleness outranks urgency.** A low reading pins brightness at
 `URGENT_LEVEL`, but once it passes `STALE_MINUTES` the light still goes off. We
 don't blaze at 100% on data that might be an hour old.
