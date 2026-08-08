@@ -95,6 +95,41 @@ BRIGHTNESS = {
 }
 
 # --------------------------------------------------------------------------
+# TREND ADJUSTMENT — edit these
+# --------------------------------------------------------------------------
+# Dexcom sends a trend arrow with every reading. These offsets shift the number
+# before the colour and the brightness level are picked, so the light shows
+# roughly where the arrow says you're heading rather than where you were five
+# minutes ago. A steady 145 stays gold; a 145 falling fast lands on 130 and
+# leans further toward orange.
+#
+# Units follow COLOR_STOPS — mg/dL by default, so mmol/L users want something
+# like 0.3 / 0.6 / 0.8 instead of 5 / 10 / 15.
+#
+# Two things to be aware of before turning these up:
+#
+#   - The offset also moves the URGENT_BELOW comparison, so a falling arrow can
+#     put the light at URGENT_LEVEL for a reading that is still in range. That
+#     is the point of the feature, but it does mean the light is showing a guess
+#     rather than a measurement. The per-cycle log line always prints the real
+#     reading alongside the adjusted one.
+#   - Nothing else changes. Staleness, the fade and the watchdog all still work
+#     off the real reading and its real timestamp.
+#
+# Set TREND_ADJUST=0 in diabetes_light.env to switch the whole thing off, or
+# override TREND_OFFSETS there to retune it. The names are Dexcom's own.
+
+TREND_OFFSETS = {
+    "DoubleUp":       15,   # ↑↑  rising quickly
+    "SingleUp":       10,   # ↑   rising
+    "FortyFiveUp":     5,   # ↗   rising slightly
+    "Flat":            0,   # →   steady
+    "FortyFiveDown":  -5,   # ↘   falling slightly
+    "SingleDown":    -10,   # ↓   falling
+    "DoubleDown":    -15,   # ↓↓  falling quickly
+}
+
+# --------------------------------------------------------------------------
 
 # The bridge uses a self-signed cert bound to its bridge id, not its IP.
 # On a LAN this is an acceptable trade; we're not sending secrets anywhere new.
@@ -182,6 +217,25 @@ class Config:
             self.stops = prepare_stops(raw_stops)
         except ValueError as exc:
             sys.exit(f"Bad colour stops: {exc}")
+
+        # Trend offsets, same deal: the env var wins over the table in the file.
+        # Parsed even when the feature is off, so a typo is caught at startup
+        # rather than the first time someone switches it back on.
+        self.trend_adjust = env("TREND_ADJUST", "1") == "1"
+        raw_offsets = os.environ.get("TREND_OFFSETS")
+        if raw_offsets:
+            try:
+                raw_offsets = json.loads(raw_offsets)
+            except json.JSONDecodeError as exc:
+                sys.exit(f"TREND_OFFSETS is not valid JSON: {exc}")
+        else:
+            raw_offsets = TREND_OFFSETS
+        try:
+            self.trend_offsets = prepare_trend_offsets(raw_offsets)
+        except ValueError as exc:
+            sys.exit(f"Bad TREND_OFFSETS: {exc}")
+        if not self.trend_adjust:
+            self.trend_offsets = {}
 
         # Freshness, in minutes. Full brightness until FRESH_MINUTES, decaying
         # to MIN_BRIGHTNESS at STALE_MINUTES, then off entirely.
@@ -346,6 +400,88 @@ def rgb_to_xy(red, green, blue):
 
 def glucose_to_xy(value, stops):
     return rgb_to_xy(*glucose_to_rgb(value, stops))
+
+
+# --------------------------------------------------------------------------
+# Trend
+# --------------------------------------------------------------------------
+
+# Dexcom's own names, in its own order. The numbers are the indexes Share uses
+# (0 is "None", 8 and 9 are "NotComputable" and "RateOutOfRange") — those three
+# carry no direction, so they never get an offset.
+TREND_ARROWS = {
+    "DoubleUp": "↑↑", "SingleUp": "↑", "FortyFiveUp": "↗", "Flat": "→",
+    "FortyFiveDown": "↘", "SingleDown": "↓", "DoubleDown": "↓↓",
+}
+TREND_NAMES = tuple(TREND_ARROWS)
+_TREND_BY_INDEX = dict(enumerate(TREND_NAMES, start=1))
+
+# Loose matching for the env file, so DoubleUp / double_up / "double up" are
+# one key, and the two awkward FortyFive names can be written as 45up / 45down.
+_TREND_LOOKUP = {name.lower(): name for name in TREND_NAMES}
+_TREND_LOOKUP.update({"45up": "FortyFiveUp", "45down": "FortyFiveDown"})
+
+
+def _canonical_trend(name):
+    """Match a trend name loosely; None if it isn't one we know."""
+    return _TREND_LOOKUP.get(re.sub(r"[^a-z0-9]", "", str(name).lower()))
+
+
+def prepare_trend_offsets(raw):
+    """Validate the trend table into {canonical name: offset}."""
+    if not raw:
+        return {}
+    if not hasattr(raw, "items"):
+        raise ValueError('must be an object, e.g. {"SingleUp": 10, "SingleDown": -10}')
+
+    offsets = {}
+    for name, offset in raw.items():
+        canonical = _canonical_trend(name)
+        if canonical is None:
+            raise ValueError(
+                f"unknown trend {name!r}. Valid names: {', '.join(TREND_NAMES)}."
+            )
+        try:
+            offsets[canonical] = float(offset)
+        except (TypeError, ValueError):
+            raise ValueError(f"offset for {canonical} is not a number: {offset!r}")
+    return offsets
+
+
+def trend_name(reading):
+    """Canonical trend name for a reading, or None if it hasn't got one.
+
+    Prefers the name and falls back to the index, because pydexcom has spelled
+    this both ways across versions and `trend` has been a plain int and an enum.
+    Anything unrecognised means no adjustment, never a crash — the arrow is the
+    least important part of a reading.
+    """
+    direction = getattr(reading, "trend_direction", None)
+    if direction is not None:
+        name = _canonical_trend(getattr(direction, "value", direction))
+        if name:
+            return name
+
+    index = getattr(reading, "trend", None)
+    index = getattr(index, "value", index)
+    try:
+        return _TREND_BY_INDEX.get(int(index))
+    except (TypeError, ValueError):
+        return None
+
+
+def trend_offset(reading, offsets):
+    """How far this reading's arrow shifts it. 0 when there's no usable arrow."""
+    return offsets.get(trend_name(reading), 0.0)
+
+
+def adjusted_value(value, offset):
+    """The number the colour and level are read off.
+
+    Floored at 1 so a hard fall can't push the reading to zero or below, where
+    it would stop meaning anything.
+    """
+    return max(value + offset, 1)
 
 
 def brightness_for_age(age_seconds, cfg, value=None):
@@ -633,7 +769,10 @@ class Runner:
                 cfg.min_brightness, floor,
             )
         self.dexcom = None
-        self.last_good = None   # (value, seconds of age at last evaluation)
+        # (value, seconds of age at last evaluation, trend offset). The offset
+        # is carried with the reading so a Share hiccup doesn't jump the colour
+        # while we age the same reading out.
+        self.last_good = None
         self.last_stamp = None  # timestamp of the most recent NEW reading
 
     def stop(self, *_):
@@ -703,10 +842,14 @@ class Runner:
             if self.last_stamp is None or stamp > self.last_stamp:
                 is_new = True
                 self.last_stamp = stamp
-            self.last_good = (reading.value, reading_age_seconds(reading))
+            self.last_good = (
+                reading.value,
+                reading_age_seconds(reading),
+                trend_offset(reading, cfg.trend_offsets),
+            )
         elif self.last_good is not None:
-            value, age = self.last_good
-            self.last_good = (value, age + cfg.poll_seconds)
+            value, age, offset = self.last_good
+            self.last_good = (value, age + cfg.poll_seconds, offset)
 
         if is_new and cfg.watchdog:
             self.bridge.arm_watchdog(cfg.light_ids, cfg.watchdog_minutes)
@@ -717,8 +860,12 @@ class Runner:
             self.bridge.turn_off(cfg.light_ids)
             return
 
-        value, age = self.last_good
-        brightness = brightness_for_age(age, cfg, value)
+        value, age, offset = self.last_good
+        # The arrow moves the number the light is drawn from, but nothing else:
+        # staleness below still tests the real age of the real reading.
+        shown = adjusted_value(value, offset)
+        adjustment = "" if not offset else f" {offset:+g} -> {shown:g}"
+        brightness = brightness_for_age(age, cfg, shown)
 
         if brightness is None:
             # We've handled staleness ourselves, so stand the bridge timers
@@ -732,11 +879,11 @@ class Runner:
             self.bridge.turn_off(cfg.light_ids)
             return
 
-        rgb = glucose_to_rgb(value, cfg.stops)
-        urgent = value <= cfg.urgent_below
+        rgb = glucose_to_rgb(shown, cfg.stops)
+        urgent = shown <= cfg.urgent_below
         log.info(
-            "Glucose %s%s | %.0fs old%s | %s | %.0f%%%s",
-            value, trend, age, "" if is_new else " [repeat]",
+            "Glucose %s%s%s | %.0fs old%s | %s | %.0f%%%s",
+            value, trend, adjustment, age, "" if is_new else " [repeat]",
             rgb_to_hex(rgb), brightness, "  URGENT LOW" if urgent else "",
         )
         self.bridge.set_color(cfg.light_ids, rgb_to_xy(*rgb), brightness)
@@ -843,6 +990,32 @@ def main():
         for value, _ in stops:
             if not (low <= value <= high):
                 print(f"  {value:8.1f}  {rgb_to_hex(glucose_to_rgb(value, stops))}  (outside preview range)")
+
+        raw_offsets = os.environ.get("TREND_OFFSETS")
+        try:
+            offsets = prepare_trend_offsets(
+                json.loads(raw_offsets) if raw_offsets else TREND_OFFSETS
+            )
+        except json.JSONDecodeError as exc:
+            sys.exit(f"TREND_OFFSETS is not valid JSON: {exc}")
+        except ValueError as exc:
+            sys.exit(f"Bad TREND_OFFSETS: {exc}")
+
+        if env("TREND_ADJUST", "1") != "1":
+            print("\nTrend adjustment: off (TREND_ADJUST=0)")
+        elif not offsets:
+            print("\nTrend adjustment: nothing configured")
+        else:
+            # Sample from the middle of the table, where a few points either way
+            # is most likely to be crossing between stops.
+            sample = stops[len(stops) // 2][0]
+            print(f"\nTrend adjustment, shown against a reading of {sample:g}:")
+            for name in TREND_NAMES:
+                offset = offsets.get(name, 0.0)
+                shown = adjusted_value(sample, offset)
+                label = f"{offset:+g}" if offset else "0"
+                print(f"  {TREND_ARROWS[name]:<3} {name:<14} {label:>6}"
+                      f"  -> {shown:7g}  {rgb_to_hex(glucose_to_rgb(shown, stops))}")
 
         fresh = env("FRESH_MINUTES", str(BRIGHTNESS["fresh_minutes"]), cast=float) * 60
         stale = env("STALE_MINUTES", str(BRIGHTNESS["stale_minutes"]), cast=float) * 60
