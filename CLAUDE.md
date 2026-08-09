@@ -113,10 +113,12 @@ rather than trying to run the loop.
 Routine output to stdout, warnings and errors to stderr, no overlap. An empty
 error log is a health signal, so don't log routine things at WARNING.
 
-The per-cycle line is the primary debugging tool and should stay parseable:
+The per-cycle line is the primary debugging tool and should stay parseable.
+Every field is padded to a fixed width so a run of lines reads as columns and
+the eye lands on whichever number changed:
 
 ```
-Glucose 143 → | 90s old | #FFC200 | 70%
+Glucose 143 →             |   90s old          | #FFC200 |  70%
 ```
 
 ## Style
