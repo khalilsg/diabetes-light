@@ -381,6 +381,42 @@ def rgb_to_hex(rgb):
     return "#" + "".join(f"{round(channel * 255):02X}" for channel in rgb)
 
 
+# Hue in degrees -> name, as (upper_bound, name) walked in order. Red wraps, so
+# it appears at both ends. The warm half is cut more finely than the cold half
+# because the default palette spends most of its range there and "orange" for
+# everything from 90 to 160 would tell you nothing.
+HUE_NAMES = [
+    (14, "red"), (38, "orange"), (48, "amber"), (66, "yellow"),
+    (160, "green"), (195, "cyan"), (250, "blue"), (290, "violet"),
+    (330, "magenta"), (345, "pink"), (360, "red"),
+]
+
+
+def rgb_to_name(rgb):
+    """A rough colour word for a reading, e.g. 'amber' or 'pale cyan'.
+
+    Derived from the colour actually being sent, not from the glucose value,
+    so it stays honest when someone replaces the palette in their env file.
+    It's a label for skim-reading a log — the hex beside it is the truth.
+    """
+    hue, saturation, value = colorsys.rgb_to_hsv(*rgb)
+
+    # Hue is meaningless once the colour is nearly grey, so don't report one.
+    if saturation < 0.10:
+        return "white" if value >= 0.75 else "grey" if value >= 0.2 else "black"
+
+    degrees = hue * 360
+    for upper, name in HUE_NAMES:
+        if degrees < upper:
+            break
+
+    if value < 0.35:
+        return f"dark {name}"
+    if saturation < 0.35:
+        return f"pale {name}"
+    return name
+
+
 def rgb_to_xy(red, green, blue):
     """sRGB to CIE xy, per Philips' documented conversion."""
     def linearise(channel):
@@ -888,9 +924,10 @@ class Runner:
         rgb = glucose_to_rgb(shown, cfg.stops)
         urgent = shown <= cfg.urgent_below
         log.info(
-            "Glucose %3s %-2s %s | %4.0fs old %s | %s | %3.0f%%%s",
+            "Glucose %3s %-2s %s | %4.0fs old %s | %s %-14s | %3.0f%%%s",
             value, trend, adjustment, age, repeat,
-            rgb_to_hex(rgb), brightness, "  URGENT LOW" if urgent else "",
+            rgb_to_hex(rgb), f"[{rgb_to_name(rgb)}]", brightness,
+            "  URGENT LOW" if urgent else "",
         )
         self.bridge.set_color(cfg.light_ids, rgb_to_xy(*rgb), brightness)
 
@@ -988,14 +1025,17 @@ def main():
         print()
         current = low
         while current <= high + 1e-9:
-            hex_colour = rgb_to_hex(glucose_to_rgb(current, stops))
+            rgb = glucose_to_rgb(current, stops)
             marker = " <- stop" if current in stop_values else ""
-            print(f"  {current:8.1f}  {hex_colour}{marker}")
+            print(f"  {current:8.1f}  {rgb_to_hex(rgb)}  "
+                  f"{rgb_to_name(rgb):<12}{marker}".rstrip())
             current += step
         # Stops that the sampling step skipped over still matter; show them.
         for value, _ in stops:
             if not (low <= value <= high):
-                print(f"  {value:8.1f}  {rgb_to_hex(glucose_to_rgb(value, stops))}  (outside preview range)")
+                rgb = glucose_to_rgb(value, stops)
+                print(f"  {value:8.1f}  {rgb_to_hex(rgb)}  {rgb_to_name(rgb):<12}"
+                      "(outside preview range)")
 
         raw_offsets = os.environ.get("TREND_OFFSETS")
         try:
@@ -1020,8 +1060,9 @@ def main():
                 offset = offsets.get(name, 0.0)
                 shown = adjusted_value(sample, offset)
                 label = f"{offset:+g}" if offset else "0"
+                rgb = glucose_to_rgb(shown, stops)
                 print(f"  {TREND_ARROWS[name]:<3} {name:<14} {label:>6}"
-                      f"  -> {shown:7g}  {rgb_to_hex(glucose_to_rgb(shown, stops))}")
+                      f"  -> {shown:7g}  {rgb_to_hex(rgb)}  {rgb_to_name(rgb)}")
 
         fresh = env("FRESH_MINUTES", str(BRIGHTNESS["fresh_minutes"]), cast=float) * 60
         stale = env("STALE_MINUTES", str(BRIGHTNESS["stale_minutes"]), cast=float) * 60

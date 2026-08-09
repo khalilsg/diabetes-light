@@ -118,8 +118,12 @@ Every field is padded to a fixed width so a run of lines reads as columns and
 the eye lands on whichever number changed:
 
 ```
-Glucose 143 →             |   90s old          | #FFC200 |  70%
+Glucose 143 →             |   90s old          | #FFC200 [amber]        |  70%
 ```
+
+The colour word comes from `rgb_to_name`, which reads the RGB actually being
+sent rather than the glucose value — a custom palette gets accurate words, and
+the word can never disagree with the hex beside it.
 
 ## Style
 
