@@ -834,7 +834,7 @@ class Runner:
         is_new = False
         trend = ""
         if reading is not None:
-            trend = f" {reading.trend_arrow}"
+            trend = reading.trend_arrow
             stamp = reading_timestamp(reading)
             # Share keeps returning the last reading forever after a sensor
             # stops. Only a timestamp that has actually advanced counts as new,
@@ -864,7 +864,13 @@ class Runner:
         # The arrow moves the number the light is drawn from, but nothing else:
         # staleness below still tests the real age of the real reading.
         shown = adjusted_value(value, offset)
-        adjustment = "" if not offset else f" {offset:+g} -> {shown:g}"
+        # Every field is padded to a fixed width so consecutive lines form
+        # columns: scanning a run of them for the one number that changed is
+        # the main thing anyone does with this log. Widths cover the extremes
+        # (a 3-digit reading, a 2-glyph arrow, a 4-digit age) and quietly
+        # stretch rather than truncate beyond them.
+        adjustment = " " * 10 if not offset else f"{offset:+3g} -> {shown:<3g}"
+        repeat = "        " if is_new else "[repeat]"
         brightness = brightness_for_age(age, cfg, shown)
 
         if brightness is None:
@@ -873,8 +879,8 @@ class Runner:
             if cfg.watchdog:
                 self.bridge.disarm_watchdog(cfg.light_ids)
             log.info(
-                "Glucose %s%s | %.0fs old - STALE, lights off",
-                value, trend, age,
+                "Glucose %3s %-2s %s | %4.0fs old %s | STALE, lights off",
+                value, trend, adjustment, age, repeat,
             )
             self.bridge.turn_off(cfg.light_ids)
             return
@@ -882,8 +888,8 @@ class Runner:
         rgb = glucose_to_rgb(shown, cfg.stops)
         urgent = shown <= cfg.urgent_below
         log.info(
-            "Glucose %s%s%s | %.0fs old%s | %s | %.0f%%%s",
-            value, trend, adjustment, age, "" if is_new else " [repeat]",
+            "Glucose %3s %-2s %s | %4.0fs old %s | %s | %3.0f%%%s",
+            value, trend, adjustment, age, repeat,
             rgb_to_hex(rgb), brightness, "  URGENT LOW" if urgent else "",
         )
         self.bridge.set_color(cfg.light_ids, rgb_to_xy(*rgb), brightness)
