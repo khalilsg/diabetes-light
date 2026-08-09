@@ -455,7 +455,7 @@ The per-cycle log always prints the real reading first, then the shift, so
 you can see both:
 
 ```
-Glucose  78 ↓↓ -15 -> 63  |  180s old          | #FF006A | 100%  URGENT LOW
+Glucose  78 ↓↓ -15 -> 63  |  180s old          | #FF006A [magenta]      | 100%  URGENT LOW
 ```
 
 ### In the env file
@@ -898,16 +898,18 @@ tail -20 out.log
 You want a recent `Glucose NNN` line. Each update logs what it calculated:
 
 ```
-Glucose  62 ↓  -10 -> 52  |   45s old          | #FF00A8 | 100%  URGENT LOW
-Glucose 143 →             |   90s old          | #FFC200 |  70%
-Glucose 118 ↗   +5 -> 123 |  400s old [repeat] | #FFA200 |  52%
+Glucose  62 ↓  -10 -> 52  |   45s old          | #FF00A8 [magenta]      | 100%  URGENT LOW
+Glucose 143 →             |   90s old          | #FFC200 [amber]        |  70%
+Glucose 118 ↗   +5 -> 123 |  400s old [repeat] | #FFA200 [amber]        |  52%
 ```
 
 Reading, trend, the trend adjustment when there is one (section 5c), age, the
-exact hex colour and brightness sent to the bridge, and
-`[repeat]` when Share handed back a reading it had already given us. The fields
-sit in fixed-width columns, so scanning a long log for the value that moved is
-a matter of looking down one column. If the light
+exact hex colour and brightness sent to the bridge, and `[repeat]` when Share
+handed back a reading it had already given us. The word after the hex is just
+that colour described in English — it's worked out from the hex itself, so it
+still matches if you've replaced the palette. The fields sit in fixed-width
+columns, so scanning a long log for the value that moved is a matter of looking
+down one column. If the light
 looks wrong, this line tells you whether the script computed the wrong colour or
 the bridge ignored a correct one. A service that's up but restart-looping
 looks identical from the outside to one that's working, so read the log rather
