@@ -83,6 +83,10 @@ COLOR_STOPS = [
 #
 # URGENT_BELOW is the exception to all of the above: at or under that reading
 # the light goes to URGENT_LEVEL and stays there, ignoring the freshness fade.
+#
+# These are the defaults for every light. A bedroom and a kitchen rarely want
+# the same numbers, so max, min and urgent_level can each be overridden per
+# room in HUE_LIGHT_GROUPS — see prepare_light_groups below.
 
 BRIGHTNESS = {
     "max": 70,             # while the reading is fresh
@@ -181,6 +185,197 @@ def env(name, default=None, required=False, cast=str):
         sys.exit(f"Setting {name} has an invalid value: {raw!r}")
 
 
+# --------------------------------------------------------------------------
+# Light groups
+# --------------------------------------------------------------------------
+# A group is a set of lights that share brightness settings — in practice, a
+# room. Every group shows the same colour at the same moment, because they are
+# all displaying one reading; what a group gets to decide is how loudly its
+# room says it. 30% at the bedside and 90% in the kitchen are the same reading.
+#
+# Timing (FRESH_MINUTES, STALE_MINUTES) and URGENT_BELOW are deliberately NOT
+# per-group. They answer "can this reading be trusted, and is it dangerous",
+# which is a fact about the data and the person, not about a room — and a
+# per-room staleness would mean one light going dark while another still
+# glowed on the same dead reading. That is exactly the ambiguity "off" is
+# supposed to be free of.
+
+# The name used when the lights aren't grouped, i.e. plain HUE_LIGHT_IDS.
+DEFAULT_GROUP_NAME = "lights"
+
+
+def brightness_from_env():
+    """The global brightness block: the table above, with env overrides."""
+    return {
+        "max": env("MAX_BRIGHTNESS", str(BRIGHTNESS["max"]), cast=float),
+        "min": env("MIN_BRIGHTNESS", str(BRIGHTNESS["min"]), cast=float),
+        "fresh_minutes": env("FRESH_MINUTES", str(BRIGHTNESS["fresh_minutes"]), cast=float),
+        "stale_minutes": env("STALE_MINUTES", str(BRIGHTNESS["stale_minutes"]), cast=float),
+        "urgent_below": env("URGENT_BELOW", str(BRIGHTNESS["urgent_below"]), cast=float),
+        "urgent_level": env("URGENT_LEVEL", str(BRIGHTNESS["urgent_level"]), cast=float),
+    }
+
+
+def validate_brightness(settings, group=None):
+    """Range-check one brightness block. Raises ValueError with a plain message.
+
+    `group` names the group in the message, and switches the wording from env
+    var names to the JSON keys, so the text points at what the user actually
+    typed.
+    """
+    where = f' in group "{group}"' if group else ""
+    for key, env_name in (("max", "MAX_BRIGHTNESS"), ("min", "MIN_BRIGHTNESS"),
+                          ("urgent_level", "URGENT_LEVEL")):
+        name = key if group else env_name
+        value = settings[key]
+        if not 1 <= value <= 100:
+            raise ValueError(f"{name}{where} must be between 1 and 100 (got {value:g}).")
+    low, high = ("min", "max") if group else ("MIN_BRIGHTNESS", "MAX_BRIGHTNESS")
+    if settings["min"] > settings["max"]:
+        raise ValueError(f"{low}{where} cannot exceed {high}.")
+
+
+class LightGroup:
+    """One room's lights, plus the brightness settings they share."""
+
+    def __init__(self, name, light_ids, settings):
+        self.name = name
+        self.light_ids = list(light_ids)
+        self.max_brightness = settings["max"]
+        self.min_brightness = settings["min"]
+        self.urgent_level = settings["urgent_level"]
+        # Shared across groups, but carried here so brightness_for_age() needs
+        # nothing but a group to work out a level.
+        self.urgent_below = settings["urgent_below"]
+        self.fresh_seconds = settings["fresh_minutes"] * 60
+        self.stale_seconds = settings["stale_minutes"] * 60
+
+
+# Group keys are matched loosely, like the trend names: "max", "max_brightness"
+# and "maxBrightness" are one key. Both a friendly and a formal spelling exist
+# for each, because the env file writes MAX_BRIGHTNESS while the table at the
+# top of this file writes "max".
+_GROUP_KEYS = {
+    "lights": "lights", "lightids": "lights", "ids": "lights",
+    "max": "max", "maxbrightness": "max",
+    "min": "min", "minbrightness": "min",
+    "urgent": "urgent_level", "urgentlevel": "urgent_level",
+}
+
+# Settings that only make sense globally. Named individually so a user who
+# tries one gets told why rather than "unknown key".
+_GROUP_SHARED_KEYS = {
+    "freshminutes", "staleminutes", "urgentbelow", "pollseconds",
+    "watchdog", "watchdogminutes", "colorstops", "colourstops",
+    "trendoffsets", "trendadjust",
+}
+
+
+def _normalise_key(key):
+    return re.sub(r"[^a-z0-9]", "", str(key).lower())
+
+
+def prepare_light_groups(raw, defaults):
+    """Validate the group table into a list of LightGroup.
+
+    Accepts either a full spec or the shorthand where a group is just its
+    lights:
+
+        {"bedroom": {"lights": ["id-a", "id-b"], "max": 30, "min": 5},
+         "kitchen": ["id-c"],
+         "office":  "id-d, id-e"}
+
+    Anything a group doesn't set falls back to `defaults`, so the common case
+    is a couple of rooms differing in one number.
+    """
+    if not raw:
+        raise ValueError("no groups defined.")
+    if not hasattr(raw, "items"):
+        raise ValueError('must be an object, e.g. {"bedroom": ["light-id"]}')
+
+    groups = []
+    owner = {}  # light id -> the group that already claims it
+    for name, spec in raw.items():
+        name = str(name).strip()
+        if not name:
+            raise ValueError("a group name can't be empty.")
+
+        # Shorthand: the value is the light list itself.
+        if isinstance(spec, (str, list, tuple)):
+            spec = {"lights": spec}
+        if not hasattr(spec, "items"):
+            raise ValueError(
+                f'group "{name}" must be a list of light ids or an object, '
+                f"got {spec!r}"
+            )
+
+        settings = dict(defaults)
+        raw_ids = None
+        for key, value in spec.items():
+            canonical = _GROUP_KEYS.get(_normalise_key(key))
+            if canonical is None:
+                if _normalise_key(key) in _GROUP_SHARED_KEYS:
+                    raise ValueError(
+                        f'"{key}" in group "{name}" is a global setting, not a '
+                        f"per-group one. Colour, timing and the urgent "
+                        f"threshold are shared by every light — only max, min "
+                        f"and urgent_level differ per group."
+                    )
+                raise ValueError(
+                    f'unknown setting "{key}" in group "{name}". '
+                    f"Valid keys: lights, max, min, urgent_level."
+                )
+            if canonical == "lights":
+                raw_ids = value
+                continue
+            try:
+                settings[canonical] = float(value)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f'{canonical} in group "{name}" is not a number: {value!r}'
+                )
+
+        if raw_ids is None:
+            raise ValueError(f'group "{name}" has no "lights".')
+        if isinstance(raw_ids, str):
+            raw_ids = raw_ids.split(",")
+        elif not isinstance(raw_ids, (list, tuple)):
+            raise ValueError(
+                f'"lights" in group "{name}" must be a list of ids or a '
+                f"comma-separated string, got {raw_ids!r}"
+            )
+
+        light_ids = []
+        for light_id in raw_ids:
+            light_id = str(light_id).strip()
+            if not light_id:
+                continue
+            if light_id in light_ids:
+                log.warning(
+                    'Light %s is listed twice in group "%s"; ignoring the repeat.',
+                    light_id, name,
+                )
+                continue
+            if light_id in owner:
+                # Two groups asking for different brightness on one bulb has no
+                # answer, and picking one silently would leave a light that
+                # quietly ignores half its config. Make the user choose.
+                raise ValueError(
+                    f'light {light_id} is in both "{owner[light_id]}" and '
+                    f'"{name}". A light can only be in one group.'
+                )
+            owner[light_id] = name
+            light_ids.append(light_id)
+
+        if not light_ids:
+            raise ValueError(f'group "{name}" has no lights in it.')
+
+        validate_brightness(settings, name)
+        groups.append(LightGroup(name, light_ids, settings))
+
+    return groups
+
+
 class Config:
     def __init__(self):
         self.dexcom_username = env("DEXCOM_USERNAME", required=True)
@@ -252,29 +447,59 @@ class Config:
                 )
 
         self.poll_seconds = env("POLL_SECONDS", "60", cast=int)
-        self.fresh_minutes = env("FRESH_MINUTES", str(BRIGHTNESS["fresh_minutes"]), cast=float)
-        self.stale_minutes = env("STALE_MINUTES", str(BRIGHTNESS["stale_minutes"]), cast=float)
-        self.max_brightness = env("MAX_BRIGHTNESS", str(BRIGHTNESS["max"]), cast=float)
-        self.min_brightness = env("MIN_BRIGHTNESS", str(BRIGHTNESS["min"]), cast=float)
-        self.urgent_below = env("URGENT_BELOW", str(BRIGHTNESS["urgent_below"]), cast=float)
-        self.urgent_level = env("URGENT_LEVEL", str(BRIGHTNESS["urgent_level"]), cast=float)
+        settings = brightness_from_env()
+        self.fresh_minutes = settings["fresh_minutes"]
+        self.stale_minutes = settings["stale_minutes"]
+        self.max_brightness = settings["max"]
+        self.min_brightness = settings["min"]
+        self.urgent_below = settings["urgent_below"]
+        self.urgent_level = settings["urgent_level"]
 
         # Everything downstream works in seconds; minutes are the input unit.
         self.fresh_seconds = self.fresh_minutes * 60
         self.stale_seconds = self.stale_minutes * 60
 
-        for name, value in (("MAX_BRIGHTNESS", self.max_brightness),
-                            ("MIN_BRIGHTNESS", self.min_brightness),
-                            ("URGENT_LEVEL", self.urgent_level)):
-            if not 1 <= value <= 100:
-                sys.exit(f"{name} must be between 1 and 100 (got {value:g}).")
-        if self.min_brightness > self.max_brightness:
-            sys.exit("MIN_BRIGHTNESS cannot exceed MAX_BRIGHTNESS.")
+        try:
+            validate_brightness(settings)
+        except ValueError as exc:
+            sys.exit(str(exc))
         if self.fresh_minutes >= self.stale_minutes:
             sys.exit(
                 f"FRESH_MINUTES ({self.fresh_minutes:g}) must be less than "
                 f"STALE_MINUTES ({self.stale_minutes:g})."
             )
+
+        # Groups. Without HUE_LIGHT_GROUPS every light is one unnamed group
+        # running the settings above, which is exactly what this did before
+        # groups existed.
+        raw_groups = os.environ.get("HUE_LIGHT_GROUPS")
+        self.named_groups = bool(raw_groups)
+        if raw_groups:
+            try:
+                self.groups = prepare_light_groups(json.loads(raw_groups), settings)
+            except json.JSONDecodeError as exc:
+                sys.exit(f"HUE_LIGHT_GROUPS is not valid JSON: {exc}")
+            except ValueError as exc:
+                sys.exit(f"Bad HUE_LIGHT_GROUPS: {exc}")
+            if self.light_ids:
+                log.warning(
+                    "HUE_LIGHT_GROUPS and HUE_LIGHT_IDS are both set. The "
+                    "groups win; HUE_LIGHT_IDS is ignored. Delete it to "
+                    "silence this."
+                )
+            # One flat list for the things that treat every light the same:
+            # the capability check, the watchdog, and turning everything off.
+            self.light_ids = [
+                light_id for group in self.groups for light_id in group.light_ids
+            ]
+        elif self.light_ids:
+            self.groups = [LightGroup(DEFAULT_GROUP_NAME, self.light_ids, settings)]
+        else:
+            self.groups = []
+
+        # Group names are padded to a fixed width in the log line, same as
+        # every other field, so consecutive lines stay in columns.
+        self.group_width = max((len(g.name) for g in self.groups), default=0)
 
         # Dead-man's switch built on the Hue v1 schedules API.
         self.watchdog = env("WATCHDOG", "1") == "1"
@@ -520,25 +745,47 @@ def adjusted_value(value, offset):
     return max(value + offset, 1)
 
 
-def brightness_for_age(age_seconds, cfg, value=None):
-    """Brightness for a reading. None means 'go dark'.
+def brightness_for_age(age_seconds, group, value=None):
+    """Brightness for a reading, for one group. None means 'go dark'.
+
+    `group` is a LightGroup, but anything carrying the same six brightness
+    attributes works — Config does, which is what the single-group case used
+    to pass.
 
     Freshness normally drives this, but a reading at or below urgent_below
     overrides the fade and pins the light at urgent_level. Staleness still
     wins over both — a low we can no longer verify is turned off rather than
     left blazing at full brightness on data that might be an hour old.
     """
-    if age_seconds >= cfg.stale_seconds:
+    if age_seconds >= group.stale_seconds:
         return None
 
-    if value is not None and value <= cfg.urgent_below:
-        return cfg.urgent_level
+    if value is not None and value <= group.urgent_below:
+        return group.urgent_level
 
-    if age_seconds <= cfg.fresh_seconds:
-        return cfg.max_brightness
-    span = max(cfg.stale_seconds - cfg.fresh_seconds, 1)
-    frac = (age_seconds - cfg.fresh_seconds) / span
-    return cfg.max_brightness - frac * (cfg.max_brightness - cfg.min_brightness)
+    if age_seconds <= group.fresh_seconds:
+        return group.max_brightness
+    span = max(group.stale_seconds - group.fresh_seconds, 1)
+    frac = (age_seconds - group.fresh_seconds) / span
+    return group.max_brightness - frac * (group.max_brightness - group.min_brightness)
+
+
+def format_levels(levels, width=0):
+    """The brightness column of the log line, from [(group, level)] pairs.
+
+    A width of 0 means don't name the groups, which is the ungrouped case:
+    the field is then the bare percentage it has always been. Otherwise each
+    group gets a fixed-width `NN% name` cell so a run of lines still reads as
+    columns.
+    """
+    if not width:
+        level = levels[0][1]
+        return f"{'off':>4}" if level is None else f"{level:3.0f}%"
+    return "  ".join(
+        (f"{'off':>4} " if level is None else f"{level:3.0f}% ")
+        + f"{group.name:<{width}}"
+        for group, level in levels
+    )
 
 
 # --------------------------------------------------------------------------
@@ -556,7 +803,7 @@ class HueBridge:
         # effect support and how far they dim.
         self.supports_effects = {}
         self.v1_ids = {}
-        self.min_dim_level = None
+        self.min_dim_levels = {}
         self._watchdog_ids = {}
 
     def _v2(self, path):
@@ -580,7 +827,6 @@ class HueBridge:
                 f"Run --list-lights to see what's there."
             )
 
-        floors = []
         for light_id in light_ids:
             light = found[light_id]
             effects = light.get("effects", {}).get("status_values", [])
@@ -592,14 +838,23 @@ class HueBridge:
                     "not colour.",
                     light_id, light.get("metadata", {}).get("name", "?"),
                 )
-            floor = light.get("dimming", {}).get("min_dim_level")
-            if floor is not None:
-                floors.append(floor)
+            self.min_dim_levels[light_id] = light.get("dimming", {}).get("min_dim_level")
 
-        # The strictest floor wins, so no light in the set is asked to go
-        # somewhere it can't follow.
-        self.min_dim_level = max(floors) if floors else None
         return found
+
+    def dim_floor(self, light_ids):
+        """The strictest floor among these lights, or None if none reported one.
+
+        Per group rather than per bridge: a kitchen bulb that bottoms out at
+        5% shouldn't force a warning about a bedside lamp that can reach 1%.
+        Within a group the strictest one wins, so no light in the set is asked
+        to go somewhere it can't follow.
+        """
+        floors = [
+            self.min_dim_levels[light_id] for light_id in light_ids
+            if self.min_dim_levels.get(light_id) is not None
+        ]
+        return max(floors) if floors else None
 
     def set_color(self, light_ids, xy, brightness):
         """Paint every light. One failure doesn't stop the others."""
@@ -789,21 +1044,35 @@ class Runner:
         self.running = True
         self.bridge = HueBridge(cfg.bridge_ip, cfg.app_key)
         self.bridge.inspect_lights(cfg.light_ids)
-        log.info(
-            "Driving %d light%s: %s",
-            len(cfg.light_ids), "" if len(cfg.light_ids) == 1 else "s",
-            ", ".join(cfg.light_ids),
-        )
-        floor = self.bridge.min_dim_level
-        if floor is not None and cfg.min_brightness < floor:
-            # Below its own floor a bulb may flicker or simply not light,
-            # which would read as "off" and mean something it doesn't.
-            log.warning(
-                "MIN_BRIGHTNESS is %.1f%% but the dimmest light in the set "
-                "bottoms out at %.1f%%. Raise MIN_BRIGHTNESS, or the faint end "
-                "of the fade may not show at all.",
-                cfg.min_brightness, floor,
+        if cfg.named_groups:
+            for group in cfg.groups:
+                log.info(
+                    "Group %s: %d light%s (%s), %g%% max / %g%% min, "
+                    "%g%% when urgent",
+                    group.name, len(group.light_ids),
+                    "" if len(group.light_ids) == 1 else "s",
+                    ", ".join(group.light_ids),
+                    group.max_brightness, group.min_brightness,
+                    group.urgent_level,
+                )
+        else:
+            log.info(
+                "Driving %d light%s: %s",
+                len(cfg.light_ids), "" if len(cfg.light_ids) == 1 else "s",
+                ", ".join(cfg.light_ids),
             )
+        for group in cfg.groups:
+            floor = self.bridge.dim_floor(group.light_ids)
+            if floor is not None and group.min_brightness < floor:
+                # Below its own floor a bulb may flicker or simply not light,
+                # which would read as "off" and mean something it doesn't.
+                log.warning(
+                    "Minimum brightness%s is %.1f%% but the dimmest light there "
+                    "bottoms out at %.1f%%. Raise it, or the faint end of the "
+                    "fade may not show at all.",
+                    f' for group "{group.name}"' if cfg.named_groups else "",
+                    group.min_brightness, floor,
+                )
         self.dexcom = None
         # (value, seconds of age at last evaluation, trend offset). The offset
         # is carried with the reading so a Share hiccup doesn't jump the colour
@@ -907,9 +1176,16 @@ class Runner:
         # stretch rather than truncate beyond them.
         adjustment = " " * 10 if not offset else f"{offset:+3g} -> {shown:<3g}"
         repeat = "        " if is_new else "[repeat]"
-        brightness = brightness_for_age(age, cfg, shown)
+        # Per group, because rooms differ in how bright they want to be. The
+        # colour below is worked out once: every group is showing the same
+        # reading, so they can only differ in level.
+        levels = [(group, brightness_for_age(age, group, shown)) for group in cfg.groups]
 
-        if brightness is None:
+        # Staleness is a global setting, so this is all groups or none. Keeping
+        # the test on the computed levels rather than on cfg.stale_seconds
+        # means the "off means nothing you can trust" rule stays owned by
+        # brightness_for_age alone.
+        if all(level is None for _, level in levels):
             # We've handled staleness ourselves, so stand the bridge timers
             # down; they'd only repeat the same action a couple of minutes later.
             if cfg.watchdog:
@@ -924,12 +1200,21 @@ class Runner:
         rgb = glucose_to_rgb(shown, cfg.stops)
         urgent = shown <= cfg.urgent_below
         log.info(
-            "Glucose %3s %-2s %s | %4.0fs old %s | %s %-14s | %3.0f%%%s",
+            "Glucose %3s %-2s %s | %4.0fs old %s | %s %-14s | %s%s",
             value, trend, adjustment, age, repeat,
-            rgb_to_hex(rgb), f"[{rgb_to_name(rgb)}]", brightness,
+            rgb_to_hex(rgb), f"[{rgb_to_name(rgb)}]",
+            format_levels(levels, cfg.group_width if cfg.named_groups else 0),
             "  URGENT LOW" if urgent else "",
         )
-        self.bridge.set_color(cfg.light_ids, rgb_to_xy(*rgb), brightness)
+        xy = rgb_to_xy(*rgb)
+        for group, level in levels:
+            # A single group that went dark on its own can't happen while
+            # staleness is global, but painting from the levels keeps this
+            # honest if that ever changes.
+            if level is None:
+                self.bridge.turn_off(group.light_ids)
+            else:
+                self.bridge.set_color(group.light_ids, xy, level)
 
     def run(self, once=False):
         signal.signal(signal.SIGTERM, self.stop)
@@ -995,10 +1280,27 @@ def main():
         key = os.environ.get("HUE_APP_KEY")
         if not key:
             sys.exit("HUE_APP_KEY not set. Run --pair first.")
+        # Annotate with the group each light is already in, so a long list is
+        # easier to check against your config. Broken group config must not
+        # stop this — listing the ids is how you fix it — so failures here are
+        # simply no annotation.
+        in_group = {}
+        try:
+            raw_groups = os.environ.get("HUE_LIGHT_GROUPS")
+            if raw_groups:
+                for group in prepare_light_groups(
+                    json.loads(raw_groups), brightness_from_env()
+                ):
+                    in_group.update({i: group.name for i in group.light_ids})
+        except Exception:
+            pass
+
         for light in HueBridge(ip, key).lights():
             name = light.get("metadata", {}).get("name", "?")
             colour = "colour" if "color" in light else "white only"
-            print(f"{light['id']}  {name}  ({colour})")
+            group = in_group.get(light["id"])
+            print(f"{light['id']}  {name}  ({colour})"
+                  + (f"  [{group}]" if group else ""))
         return
 
     if args.preview is not None:
@@ -1064,26 +1366,41 @@ def main():
                 print(f"  {TREND_ARROWS[name]:<3} {name:<14} {label:>6}"
                       f"  -> {shown:7g}  {rgb_to_hex(rgb)}  {rgb_to_name(rgb)}")
 
-        fresh = env("FRESH_MINUTES", str(BRIGHTNESS["fresh_minutes"]), cast=float) * 60
-        stale = env("STALE_MINUTES", str(BRIGHTNESS["stale_minutes"]), cast=float) * 60
-        cap = env("MAX_BRIGHTNESS", str(BRIGHTNESS["max"]), cast=float)
-        floor = env("MIN_BRIGHTNESS", str(BRIGHTNESS["min"]), cast=float)
-        curve = type("B", (), {
-            "fresh_seconds": fresh, "stale_seconds": stale,
-            "max_brightness": cap, "min_brightness": floor,
-        })
+        settings = brightness_from_env()
+        try:
+            validate_brightness(settings)
+        except ValueError as exc:
+            sys.exit(str(exc))
 
-        print(f"\nBrightness: {cap:g}% fresh -> {floor:g}% at {stale / 60:g} min, then off\n")
-        span = int(stale) + 120
-        for age in range(0, span, max(span // 10, 60)):
-            level = brightness_for_age(age, curve)
-            shown = "off" if level is None else f"{level:5.1f}%"
-            note = ""
-            if level is not None and age <= fresh:
-                note = "  (fresh)"
-            elif level is None:
-                note = "  (stale)"
-            print(f"  {age // 60:3d}m {age % 60:02d}s  {shown}{note}")
+        # One curve per group, since that's what differs between them. With no
+        # groups configured — including no lights at all, which is the state
+        # this command is usually run in — there's a single unnamed curve.
+        raw_groups = os.environ.get("HUE_LIGHT_GROUPS")
+        if raw_groups:
+            try:
+                groups = prepare_light_groups(json.loads(raw_groups), settings)
+            except json.JSONDecodeError as exc:
+                sys.exit(f"HUE_LIGHT_GROUPS is not valid JSON: {exc}")
+            except ValueError as exc:
+                sys.exit(f"Bad HUE_LIGHT_GROUPS: {exc}")
+        else:
+            groups = [LightGroup(DEFAULT_GROUP_NAME, [], settings)]
+
+        for group in groups:
+            label = f" [{group.name}]" if raw_groups else ""
+            stale = group.stale_seconds
+            print(f"\nBrightness{label}: {group.max_brightness:g}% fresh -> "
+                  f"{group.min_brightness:g}% at {stale / 60:g} min, then off\n")
+            span = int(stale) + 120
+            for age in range(0, span, max(span // 10, 60)):
+                level = brightness_for_age(age, group)
+                shown = "off" if level is None else f"{level:5.1f}%"
+                note = ""
+                if level is not None and age <= group.fresh_seconds:
+                    note = "  (fresh)"
+                elif level is None:
+                    note = "  (stale)"
+                print(f"  {age // 60:3d}m {age % 60:02d}s  {shown}{note}")
         return
 
     cfg = Config()
@@ -1092,7 +1409,10 @@ def main():
     if not cfg.app_key:
         sys.exit("HUE_APP_KEY not set. Run --pair first.")
     if not cfg.light_ids:
-        sys.exit("HUE_LIGHT_IDS not set. Run --list-lights first.")
+        sys.exit(
+            "No lights configured. Set HUE_LIGHT_IDS (or HUE_LIGHT_GROUPS, to "
+            "give rooms their own brightness). Run --list-lights first."
+        )
 
     try:
         runner = Runner(cfg)

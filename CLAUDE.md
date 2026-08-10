@@ -61,6 +61,15 @@ fresh. The log line prints the real reading first, then the shift.
 `URGENT_LEVEL`, but once it passes `STALE_MINUTES` the light still goes off. We
 don't blaze at 100% on data that might be an hour old.
 
+**Groups differ in level, never in meaning.** `HUE_LIGHT_GROUPS` lets each room
+set `max`, `min` and `urgent_level`. Everything else is global on purpose:
+colour (one reading described one way), `FRESH_MINUTES`/`STALE_MINUTES` (one
+light going dark while another glows on the same dead reading would wreck what
+"off" means), and `URGENT_BELOW` (a fact about the person, not the room).
+`prepare_light_groups` rejects those keys by name rather than ignoring them.
+A light may only be in one group — two groups asking for different brightness
+on one bulb has no answer, so it's a startup error.
+
 **No green in the default palette.** Green reads as "fine" to anyone who has
 used a CGM app. The high side deliberately routes through cream and white to
 reach cyan rather than taking the shorter path through green.
@@ -83,8 +92,9 @@ These have all bitten before:
   at runtime. Don't "simplify" it away — Python 3.8 users are pinned to 0.4.0.
 - **The env parser strips `# comments` only after whitespace,** so a `#` inside
   a password survives. Quoted values are taken verbatim.
-- **`min_dim_level` differs per bulb.** With multiple lights we use the
-  strictest floor so nothing is asked to dim below what it can do.
+- **`min_dim_level` differs per bulb.** `HueBridge.dim_floor()` takes the
+  strictest floor within a group, so nothing is asked to dim below what it can
+  do — and a strict bulb in one room doesn't drag a warning onto another.
 - **One failing light must not stop the others.** Per-light calls catch and log.
 
 ## Testing
@@ -105,8 +115,10 @@ changing the palette** and eyeball the hex values — check nothing drifts
 through green on the high side.
 
 For logic changes, import the module and call the pure functions directly
-(`glucose_to_rgb`, `brightness_for_age`, `prepare_stops`, `_watchdog_body`)
-rather than trying to run the loop.
+(`glucose_to_rgb`, `brightness_for_age`, `prepare_stops`, `prepare_light_groups`,
+`format_levels`, `_watchdog_body`) rather than trying to run the loop.
+`brightness_for_age` takes a `LightGroup`, but anything carrying the same six
+brightness attributes works.
 
 ## Logging
 
@@ -124,6 +136,11 @@ Glucose 143 →             |   90s old          | #FFC200 [amber]        |  70%
 The colour word comes from `rgb_to_name`, which reads the RGB actually being
 sent rather than the glucose value — a custom palette gets accurate words, and
 the word can never disagree with the hex beside it.
+
+With `HUE_LIGHT_GROUPS` set, `format_levels` turns the brightness field into one
+`NN% name` cell per group, padded to the longest group name. Without it the
+field is the bare percentage it has always been, so an ungrouped install's log
+is unchanged.
 
 ## Style
 

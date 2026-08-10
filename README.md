@@ -160,6 +160,9 @@ You can drive **more than one light** — list the ids comma-separated in
 `HUE_LIGHT_IDS` and they'll all show the same colour and brightness together.
 Useful if you want one in the bedroom and one in the kitchen.
 
+If those two rooms want different brightness — and a bedroom usually does —
+put the lights in named groups instead. See section 5d.
+
 ## 5. Configure
 
 Copy `diabetes_light.env.example` to `diabetes_light.env` and fill it out —
@@ -173,8 +176,9 @@ DEXCOM_REGION=us
 HUE_BRIDGE_IP=192.168.1.50
 HUE_APP_KEY=...
 HUE_LIGHT_IDS=...          # one id, or several separated by commas
+                           # (or HUE_LIGHT_GROUPS, for per-room brightness — 5d)
 
-# Optional — see sections 5a, 5b and 5c below
+# Optional — see sections 5a to 5d below
 MAX_BRIGHTNESS=70
 MIN_BRIGHTNESS=10
 FRESH_MINUTES=6
@@ -395,6 +399,9 @@ The script refuses to start on values outside 1-100, a `min` above `max`, or a
 `fresh` at or beyond `stale`. If you change `STALE_MINUTES`, keep it comfortably
 below `WATCHDOG_MINUTES` — see section 8.
 
+These apply to every light. To give one room its own brightness while the rest
+keep these, see section 5d.
+
 `FRESH_SECONDS` and `STALE_SECONDS` were the old names. If either is still in
 your env file the script stops with a message telling you what to rename.
 
@@ -504,6 +511,116 @@ Trend adjustment, shown against a reading of 145:
   ↘   FortyFiveDown      -5  ->     140  #FFBC00
   ↓   SingleDown        -10  ->     135  #FFB400
   ↓↓  DoubleDown        -15  ->     130  #FFAC00
+```
+
+## 5d. Different rooms, different brightness
+
+`HUE_LIGHT_IDS` drives every light at the same brightness. That's usually wrong
+the moment the lights are in different rooms: 70% is comfortable on a desk and
+glaring at 3am on a bedside table.
+
+Replace it with `HUE_LIGHT_GROUPS`, which names each room and gives it its own
+numbers. One line, JSON, double quotes:
+
+```
+HUE_LIGHT_GROUPS={"bedroom":{"lights":["id-a"],"max":25,"min":3,"urgent_level":60},"kitchen":{"lights":["id-b","id-c"],"max":95},"office":["id-d"]}
+```
+
+That's a dim bedside light, a bright pair in the kitchen, and an office light
+running whatever the global defaults are.
+
+`--list-lights` marks which group each light is already in, which makes a long
+list much easier to check:
+
+```
+a1b2c3d4-...  Bedside Go     (colour)  [bedroom]
+e5f6a7b8-...  Kitchen strip  (colour)  [kitchen]
+c9d0e1f2-...  Hallway lamp   (colour)
+```
+
+### What a group can set
+
+| Key | Meaning |
+|---|---|
+| `lights` | The ids. A list, or one comma-separated string. |
+| `max` | Brightness while the reading is fresh. |
+| `min` | Brightness just before it goes stale. |
+| `urgent_level` | Brightness for a reading at or below `URGENT_BELOW`. |
+
+Anything a group leaves out falls back to the global setting, so the common
+case — one room that wants to be dimmer — is a single number. `max_brightness`
+and `min_brightness` work as spellings too, if matching the env var names reads
+better to you.
+
+A group that only needs its ids can skip the object entirely:
+
+```
+HUE_LIGHT_GROUPS={"bedroom":["id-a"],"kitchen":["id-b","id-c"]}
+```
+
+That's the same as `HUE_LIGHT_IDS` with all five lights, just labelled in the
+log. Which is worth something on its own when a light stops responding.
+
+### What stays global, and why
+
+**Colour.** Every group is displaying the same reading at the same moment. A
+per-room palette would mean the same number described two different ways in one
+house, and you'd have to remember which room you were looking at before you
+could read it.
+
+**`FRESH_MINUTES` and `STALE_MINUTES`.** Freshness is a fact about the data, not
+about a room. If they were per-group, one light would go dark while another kept
+glowing on the same dead reading — and "off" would stop meaning "there is no
+reading you can trust", which is the one thing it's for.
+
+**`URGENT_BELOW`.** Whether a reading is dangerous is a fact about you. *How
+loud* each room gets about it is the part that varies by room, and that's
+`urgent_level`.
+
+The script stops at startup if you put one of those inside a group, and says so
+rather than ignoring it.
+
+### Rules
+
+- **A light belongs to exactly one group.** Listing it twice is an error, not a
+  guess — two groups asking for different brightness on one bulb has no right
+  answer, and picking one silently would leave a light quietly ignoring half
+  your config.
+- **`HUE_LIGHT_GROUPS` wins** if `HUE_LIGHT_IDS` is also set. The script logs a
+  warning; delete the old line.
+- **Same validation as everything else** — 1-100, `min` no higher than `max`,
+  checked per group with the group named in the message.
+- **The watchdog covers every light** in every group, exactly as before. One
+  bridge schedule per light, group or no group.
+
+### Preview it
+
+```bash
+python diabetes_light.py --preview
+```
+
+Prints a labelled brightness curve per group, so you can compare rooms without
+waiting thirteen minutes:
+
+```
+Brightness [bedroom]: 25% fresh -> 3% at 13 min, then off
+
+    0m 00s   25.0%  (fresh)
+    ...
+   13m 30s  off  (stale)
+
+Brightness [kitchen]: 95% fresh -> 10% at 13 min, then off
+
+    0m 00s   95.0%  (fresh)
+    ...
+```
+
+The per-cycle log gains a column per group, so you can see at a glance that
+each room got what it was meant to:
+
+```
+Glucose 143 →             |   60s old          | #FFC100 [amber]        |  25% bedroom   70% kitchen
+Glucose  62 →             |   60s old          | #FF0071 [pink]         |  50% bedroom  100% kitchen  URGENT LOW
 ```
 
 ## 6. Test it
@@ -905,7 +1022,8 @@ Glucose 118 ↗   +5 -> 123 |  400s old [repeat] | #FFA200 [amber]        |  52%
 
 Reading, trend, the trend adjustment when there is one (section 5c), age, the
 exact hex colour and brightness sent to the bridge, and `[repeat]` when Share
-handed back a reading it had already given us. The word after the hex is just
+handed back a reading it had already given us. With groups configured (section
+5d) the brightness field becomes one column per group, named. The word after the hex is just
 that colour described in English — it's worked out from the hex itself, so it
 still matches if you've replaced the palette. The fields sit in fixed-width
 columns, so scanning a long log for the value that moved is a matter of looking
