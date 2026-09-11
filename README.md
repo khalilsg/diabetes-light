@@ -664,6 +664,55 @@ sudo systemctl enable --now diabetes-light
 journalctl -u diabetes-light -f
 ```
 
+### Linux without root
+
+No sudo? Run it as a **user** service instead. It runs as you, from wherever
+you put the script, and never needs root.
+
+`~/.config/systemd/user/diabetes-light.service`:
+
+```ini
+[Unit]
+Description=CGM ambient light
+# Never give up restarting. RestartSec already keeps retries gentle.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=%h/diabetes-light
+ExecStart=%h/diabetes-light/venv/bin/python %h/diabetes-light/diabetes_light.py
+Restart=always
+RestartSec=30
+StandardOutput=append:%h/.local/state/diabetes-light/out.log
+StandardError=append:%h/.local/state/diabetes-light/err.log
+
+[Install]
+WantedBy=default.target
+```
+
+`%h` is your home directory; change the paths if the script lives elsewhere.
+
+```bash
+mkdir -p ~/.local/state/diabetes-light
+systemctl --user daemon-reload
+systemctl --user enable --now diabetes-light
+loginctl enable-linger $USER
+tail -f ~/.local/state/diabetes-light/out.log
+```
+
+**Don't skip `enable-linger`.** Without it, user services only run while you're
+logged in — they won't start at boot, and they stop when you log out. That's
+exactly the failure you're trying to avoid.
+
+There's no `After=network-online.target`: user units can't wait on it. That's
+fine. If the bridge isn't reachable yet at boot, the script exits with a message
+and systemd starts it again 30 seconds later. `StartLimitIntervalSec=0` is what
+stops systemd giving up on it after a few quick failures.
+
+Elsewhere in this README, swap `sudo systemctl` (or plain `systemctl`) for
+`systemctl --user`, and read `~/.local/state/diabetes-light/out.log` where it
+says `journalctl`.
+
 ### Two log streams
 
 Routine glucose updates go to **stdout**. Warnings and errors go to **stderr**.
@@ -673,22 +722,39 @@ That means `err.log` staying empty is itself a health signal — if it has conte
 something needs attention, and you don't have to read past a thousand normal
 lines to find it.
 
-With systemd, journald keeps them separate already:
-
-```bash
-journalctl -u diabetes-light -p warning    # problems only
-journalctl -u diabetes-light -f            # everything, live
-```
-
-To write them to files instead, add to the `[Service]` block:
+**journald does not keep them apart.** It gives stdout and stderr the same
+priority (info), so `journalctl -p warning` shows nothing at all — not even real
+errors. To get the empty-`err.log` signal on Linux, send the two streams to
+files. Add to the `[Service]` block:
 
 ```ini
 StandardOutput=append:/var/log/diabetes-light/out.log
 StandardError=append:/var/log/diabetes-light/err.log
 ```
 
-(Create that directory first and make it writable by the service user.) With
-NSSM, `AppStdout` and `AppStderr` are already pointed at separate files above.
+Create that directory first — systemd opens the files itself, but won't create
+a missing directory. (The user-service unit above already logs to files.) Once
+you've switched, the output goes to the files instead of the journal, so read
+`out.log` wherever this README says `journalctl`:
+
+```bash
+tail -f /var/log/diabetes-light/out.log    # everything, live
+cat /var/log/diabetes-light/err.log        # problems only — empty is good
+```
+
+If you'd rather stay in the journal, filter on the level word each line
+carries:
+
+```bash
+journalctl -u diabetes-light --grep 'WARNING|ERROR|CRITICAL'
+```
+
+That's a weaker signal. It misses startup failures, like a bridge it can't
+reach, because those print a plain message with no level word. It also shows
+only the first line of a traceback.
+
+With NSSM, `AppStdout` and `AppStderr` are already pointed at separate files
+below; launchd's `StandardOutPath` and `StandardErrorPath` do the same.
 
 ### Windows (NSSM)
 
