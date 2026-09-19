@@ -142,7 +142,7 @@ First save the two values from the previous step into `diabetes_light.env`,
 next to the script:
 
 ```
-HUE_BRIDGE_IP=192.168.1.50
+HUE_BRIDGE_IP=192.0.2.10
 HUE_APP_KEY=...
 ```
 
@@ -173,7 +173,7 @@ DEXCOM_USERNAME=you@example.com
 DEXCOM_PASSWORD=...
 DEXCOM_REGION=us
 
-HUE_BRIDGE_IP=192.168.1.50
+HUE_BRIDGE_IP=192.0.2.10
 HUE_APP_KEY=...
 HUE_LIGHT_IDS=...          # one id, or several separated by commas
                            # (or HUE_LIGHT_GROUPS, for per-room brightness — 5d)
