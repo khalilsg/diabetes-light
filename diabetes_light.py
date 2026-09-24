@@ -20,9 +20,13 @@ import os
 import re
 import signal
 import sys
+import threading
 import time
+from collections import deque
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import requests
 import urllib3
@@ -132,6 +136,19 @@ TREND_OFFSETS = {
     "SingleDown":    -10,   # ↓   falling
     "DoubleDown":    -15,   # ↓↓  falling quickly
 }
+
+# --------------------------------------------------------------------------
+# STATUS PAGE — optional
+# --------------------------------------------------------------------------
+# A web page showing what the per-cycle log line shows: the reading, its age,
+# the colour and brightness each room was sent, plus recent history and any
+# warnings. 0 leaves it off. Set a port (e.g. STATUS_PORT=8768 in
+# diabetes_light.env) to turn it on.
+#
+# It only ever listens on 127.0.0.1, and speaks plain HTTP. To reach it from a
+# phone over HTTPS, put `tailscale serve` in front of it — see the README.
+
+STATUS_PORT = 0
 
 # --------------------------------------------------------------------------
 
@@ -504,6 +521,11 @@ class Config:
         # Dead-man's switch built on the Hue v1 schedules API.
         self.watchdog = env("WATCHDOG", "1") == "1"
         self.watchdog_minutes = env("WATCHDOG_MINUTES", "15", cast=float)
+
+        self.status_port = env("STATUS_PORT", str(STATUS_PORT), cast=int) or 0
+        if not 0 <= self.status_port <= 65535:
+            sys.exit(f"STATUS_PORT must be between 1 and 65535, or 0 for off "
+                     f"(got {self.status_port}).")
 
         if self.watchdog:
             margin_seconds = self.watchdog_minutes * 60 - self.stale_seconds
@@ -1035,6 +1057,210 @@ def reading_age_seconds(reading):
 
 
 # --------------------------------------------------------------------------
+# Status page
+# --------------------------------------------------------------------------
+# The per-cycle log line, as a web page. The page reports what the loop has
+# already decided and never works out a colour or a level of its own, so it
+# can't disagree with the light.
+#
+# It binds 127.0.0.1 and nothing else, on purpose, and there is no setting to
+# change that. The page shows health data and has no login, so the only ways in
+# are this machine and whatever you deliberately put in front of it — in
+# practice `tailscale serve`, which also supplies a real HTTPS certificate.
+# A self-signed cert here would only teach you to click through warnings.
+#
+# History is kept in memory. A restart starts it again, which is honest: the
+# page never shows a reading this process didn't see.
+
+STATUS_HISTORY_HOURS = 12
+STATUS_PROBLEMS_KEPT = 50
+
+
+class RecentProblems(logging.Handler):
+    """The last few warnings and errors, for the status page.
+
+    Installed at startup rather than with the page, so a config warning logged
+    before the page exists still shows up on it.
+    """
+
+    def __init__(self, size=STATUS_PROBLEMS_KEPT):
+        super().__init__(level=logging.WARNING)
+        self.items = deque(maxlen=size)
+
+    def emit(self, record):
+        try:
+            message = record.getMessage()
+        except Exception:
+            message = str(record.msg)
+        self.items.append(
+            {"time": record.created, "level": record.levelname, "message": message}
+        )
+
+    def snapshot(self):
+        self.acquire()
+        try:
+            return list(self.items)
+        finally:
+            self.release()
+
+
+class StatusBoard:
+    """What the page shows: every recent cycle, plus recent problems.
+
+    Written by the loop, read by the web server's threads, hence the lock.
+    """
+
+    def __init__(self, cfg, problems):
+        self.problems = problems
+        self.boot = time.time()
+        self._lock = threading.Lock()
+        self._seq = 0
+        self.history_size = max(
+            int(STATUS_HISTORY_HOURS * 3600 / max(cfg.poll_seconds, 1)), 1
+        )
+        self._cycles = deque(maxlen=self.history_size)
+        # Warnings quote exceptions, and a failed v1 call quotes its URL —
+        # which has the Hue app key in it. err.log on this machine is one
+        # thing; a page on the tailnet is another. Very short values are left
+        # alone rather than blanking every matching fragment of a message.
+        self._secrets = [
+            secret for secret in (cfg.app_key, cfg.dexcom_password)
+            if secret and len(secret) >= 4
+        ]
+        self.settings = {
+            "poll_seconds": cfg.poll_seconds,
+            "fresh_minutes": cfg.fresh_minutes,
+            "stale_minutes": cfg.stale_minutes,
+            "watchdog": cfg.watchdog,
+            "watchdog_minutes": cfg.watchdog_minutes,
+            "urgent_below": cfg.urgent_below,
+            "trend_adjust": bool(cfg.trend_offsets),
+            "named_groups": cfg.named_groups,
+            "groups": [
+                {"name": group.name, "lights": len(group.light_ids),
+                 "max": group.max_brightness, "min": group.min_brightness,
+                 "urgent_level": group.urgent_level}
+                for group in cfg.groups
+            ],
+            "history_size": self.history_size,
+        }
+
+    def record(self, cycle):
+        with self._lock:
+            self._seq += 1
+            self._cycles.append(dict(cycle, seq=self._seq))
+
+    def _redact(self, text):
+        for secret in self._secrets:
+            text = text.replace(secret, "[hidden]")
+        return text
+
+    def snapshot(self, after=0):
+        """Everything the page needs. `after` skips cycles it already has.
+
+        The page asks every few seconds, and twelve hours of cycles is a few
+        hundred KB, so only the full load sends the lot. `boot` changes when
+        the process restarts, which tells the page its sequence numbers no
+        longer mean anything.
+        """
+        with self._lock:
+            cycles = [cycle for cycle in self._cycles if cycle["seq"] > after]
+        problems = [
+            dict(item, message=self._redact(item["message"]))
+            for item in self.problems.snapshot()
+        ]
+        return {
+            "now": time.time(), "boot": self.boot, "settings": self.settings,
+            "cycles": cycles, "problems": problems,
+        }
+
+
+def make_status_handler(board):
+    page = STATUS_PAGE.encode("utf-8")
+
+    class Handler(BaseHTTPRequestHandler):
+        def version_string(self):
+            return "diabetes-light"
+
+        def _send(self, code, body, content_type, extra=None):
+            self.send_response(code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            # Live health data: nothing between here and the browser should
+            # keep a copy, and a cached page is a page showing old numbers.
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+            for key, value in (extra or {}).items():
+                self.send_header(key, value)
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
+        def do_GET(self):  # noqa: N802
+            parts = urlsplit(self.path)
+            if parts.path in ("/", "/index.html"):
+                return self._send(200, page, "text/html; charset=utf-8", {
+                    # The page is self-contained: one inline style, one inline
+                    # script, and a fetch back to this server. Nothing else
+                    # may load.
+                    "Content-Security-Policy": (
+                        "default-src 'none'; connect-src 'self'; "
+                        "script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+                        "img-src data:; base-uri 'none'; form-action 'none'; "
+                        "frame-ancestors 'none'"
+                    ),
+                })
+            if parts.path == "/status.json":
+                after = 0
+                match = re.fullmatch(r"after=(\d+)", parts.query)
+                if match:
+                    after = int(match.group(1))
+                body = json.dumps(board.snapshot(after)).encode("utf-8")
+                return self._send(200, body, "application/json")
+            self._send(404, b"404 Not Found\n", "text/plain; charset=utf-8")
+
+        do_HEAD = do_GET  # noqa: N815
+
+        def _refuse(self):
+            # Read-only by construction: nothing on this page changes anything.
+            self._send(405, b"405 Method Not Allowed\n", "text/plain; charset=utf-8",
+                       {"Allow": "GET, HEAD"})
+
+        do_POST = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = _refuse  # noqa: N815
+
+        def log_message(self, format, *args):  # noqa: A002
+            # Never stdout at INFO: that stream is the per-cycle log, and a
+            # request line between two glucose lines breaks the columns.
+            log.debug("status page: %s %s", self.address_string(), format % args)
+
+    return Handler
+
+
+def start_status_page(board, port):
+    """Serve the page from a background thread. Returns the server, or None.
+
+    A port that's taken is a warning, not an exit. The page is a window onto
+    the light, and a broken window is no reason to switch the light off.
+    """
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", port), make_status_handler(board))
+    except OSError as exc:
+        log.warning(
+            "Could not start the status page on port %d (%s). The light carries "
+            "on without it. Pick another STATUS_PORT, or set it to 0.",
+            port, exc.strerror or exc,
+        )
+        return None
+    server.daemon_threads = True
+    threading.Thread(
+        target=server.serve_forever, name="status-page", daemon=True
+    ).start()
+    log.info("Status page on http://127.0.0.1:%d/", port)
+    return server
+
+
+# --------------------------------------------------------------------------
 # Main loop
 # --------------------------------------------------------------------------
 
@@ -1079,6 +1305,12 @@ class Runner:
         # while we age the same reading out.
         self.last_good = None
         self.last_stamp = None  # timestamp of the most recent NEW reading
+        # When the reading in last_good was taken. Only the status page needs
+        # it, to keep ageing the reading between cycles.
+        self.last_good_stamp = None
+        # The status page, if STATUS_PORT is set. Each cycle hands it the same
+        # facts the log line prints.
+        self.board = None
 
     def stop(self, *_):
         log.info("Shutting down.")
@@ -1141,6 +1373,7 @@ class Runner:
         if reading is not None:
             trend = reading.trend_arrow
             stamp = reading_timestamp(reading)
+            self.last_good_stamp = stamp
             # Share keeps returning the last reading forever after a sensor
             # stops. Only a timestamp that has actually advanced counts as new,
             # or the watchdog would re-arm itself on stale data indefinitely.
@@ -1162,6 +1395,7 @@ class Runner:
 
         if self.last_good is None:
             log.info("No reading yet - lights off")
+            self._report("waiting", fetch_failed=reading is None)
             self.bridge.turn_off(cfg.light_ids)
             return
 
@@ -1180,6 +1414,11 @@ class Runner:
         # colour below is worked out once: every group is showing the same
         # reading, so they can only differ in level.
         levels = [(group, brightness_for_age(age, group, shown)) for group in cfg.groups]
+        facts = {
+            "value": value, "trend": trend, "offset": offset, "shown": shown,
+            "age": age, "new": is_new, "fetch_failed": reading is None,
+            "reading_time": self.last_good_stamp.timestamp(),
+        }
 
         # Staleness is a global setting, so this is all groups or none. Keeping
         # the test on the computed levels rather than on cfg.stale_seconds
@@ -1194,6 +1433,7 @@ class Runner:
                 "Glucose %3s %-2s %s | %4.0fs old %s | STALE, lights off",
                 value, trend, adjustment, age, repeat,
             )
+            self._report("stale", **facts)
             self.bridge.turn_off(cfg.light_ids)
             return
 
@@ -1206,6 +1446,11 @@ class Runner:
             format_levels(levels, cfg.group_width if cfg.named_groups else 0),
             "  URGENT LOW" if urgent else "",
         )
+        self._report(
+            "on", hex=rgb_to_hex(rgb), colour=rgb_to_name(rgb), urgent=urgent,
+            levels=[{"group": group.name, "level": level} for group, level in levels],
+            **facts,
+        )
         xy = rgb_to_xy(*rgb)
         for group, level in levels:
             # A single group that went dark on its own can't happen while
@@ -1215,6 +1460,16 @@ class Runner:
                 self.bridge.turn_off(group.light_ids)
             else:
                 self.bridge.set_color(group.light_ids, xy, level)
+
+    def _report(self, state, **facts):
+        """Hand this cycle to the status page, if there is one.
+
+        Called before the lights are painted, like the log line, so a bridge
+        that hangs doesn't hold back the page. `state` is what the lights were
+        told: "on", "stale" (off) or "waiting" (off, nothing read yet).
+        """
+        if self.board is not None:
+            self.board.record(dict(facts, state=state, time=time.time()))
 
     def run(self, once=False):
         signal.signal(signal.SIGTERM, self.stop)
@@ -1259,9 +1514,13 @@ def main():
     to_stderr.setFormatter(formatter)
     to_stderr.setLevel(logging.WARNING)
 
+    # Keeps recent warnings for the status page. It holds them in memory and
+    # prints nothing, so it costs nothing when the page is off.
+    problems = RecentProblems()
+
     root = logging.getLogger()
     root.setLevel(logging.DEBUG if args.verbose else logging.INFO)
-    root.handlers = [to_stdout, to_stderr]
+    root.handlers = [to_stdout, to_stderr, problems]
 
     load_env_file()
 
@@ -1425,7 +1684,531 @@ def main():
     except RuntimeError as exc:
         sys.exit(str(exc))
 
+    # Not for --once: the page would be gone before anyone could load it.
+    if cfg.status_port and not args.once:
+        runner.board = StatusBoard(cfg, problems)
+        start_status_page(runner.board, cfg.status_port)
+
     runner.run(once=args.once)
+
+
+
+# --------------------------------------------------------------------------
+# The status page's HTML
+# --------------------------------------------------------------------------
+# Kept down here so it doesn't sit between the code paths above. One string,
+# no external files, fonts or scripts: the page has to work on a phone over
+# the tailnet with nothing else reachable.
+#
+# The page follows the light's rule: fail dark. It re-applies STALE_MINUTES
+# itself between cycles, greys out when it can't reach this process, and says
+# so when the loop has stopped cycling. Every value from the server goes in
+# with textContent, never as HTML — warnings quote exception text from Share
+# and the bridge.
+
+STATUS_PAGE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<meta name="robots" content="noindex">
+<title>diabetes-light</title>
+<link id="icon" rel="icon" href="data:,">
+<style>
+:root{
+  --bg:#111214; --card:#1a1b1f; --ink:#e9e7e2; --soft:#a6a29a; --faint:#6c6962;
+  --rule:#2a2c31; --lamp-off:#26282d; --bar:#34373d;
+  --note-bg:#2b2214; --note-rule:#5c4a22; --note-ink:#e6cd8f;
+  --alert:#ff6b8a;
+  --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  --mono:ui-monospace,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+}
+@media (prefers-color-scheme:light){
+:root{
+  --bg:#f6f5f2; --card:#fff; --ink:#1a1916; --soft:#55524c; --faint:#8a867e;
+  --rule:#e3dfd8; --lamp-off:#dcd9d2; --bar:#e6e3dd;
+  --note-bg:#fdf6e8; --note-rule:#e6d4a8; --note-ink:#6b4e16;
+  --alert:#b8123a;
+}
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0; background:var(--bg); color:var(--ink); font:15px/1.5 var(--sans);
+  -webkit-font-smoothing:antialiased}
+.wrap{max-width:780px; margin:0 auto; padding:20px 16px 64px}
+header{display:flex; align-items:baseline; justify-content:space-between; gap:12px;
+  flex-wrap:wrap; margin-bottom:16px}
+h1{font-size:15px; font-weight:600; margin:0; letter-spacing:.02em}
+h2{font-size:13px; font-weight:600; text-transform:uppercase; letter-spacing:.08em;
+  color:var(--soft); margin:32px 0 10px}
+.contact{font-size:13px; color:var(--faint)}
+.contact.lost{color:var(--alert); font-weight:600}
+.hidden{display:none !important}
+.num{font-variant-numeric:tabular-nums}
+
+.notes{display:grid; gap:8px; margin-bottom:12px}
+.note{padding:10px 14px; background:var(--note-bg); border:1px solid var(--note-rule);
+  border-radius:8px; color:var(--note-ink); font-size:14px}
+
+.card{background:var(--card); border:1px solid var(--rule); border-radius:12px; padding:20px}
+.hero{display:flex; gap:24px; align-items:center}
+.lamp{width:112px; height:112px; border-radius:50%; flex:none; background:var(--lamp-off);
+  transition:background-color .6s, box-shadow .6s, filter .6s}
+.lamp.dark{box-shadow:inset 0 0 0 2px var(--rule)}
+.readout{min-width:0}
+.state{font-size:13px; font-weight:600; text-transform:uppercase; letter-spacing:.08em;
+  color:var(--soft)}
+.state .urgent{color:var(--alert)}
+.big{display:flex; align-items:baseline; gap:10px; margin:2px 0 4px}
+.value{font-size:64px; line-height:1; font-weight:650; letter-spacing:-.02em}
+.arrow{font-size:36px; line-height:1; color:var(--soft)}
+.dim .value,.dim .arrow{color:var(--faint)}
+.sub{color:var(--soft); font-size:14px}
+.lost-view .lamp{filter:grayscale(1) brightness(.5)}
+.lost-view .value,.lost-view .arrow{color:var(--faint)}
+.lost-view .facts{opacity:.45}
+
+dl.facts{display:grid; grid-template-columns:max-content minmax(0,1fr); gap:8px 18px;
+  margin:20px 0 0; padding-top:16px; border-top:1px solid var(--rule)}
+dl.facts dt{color:var(--faint); font-size:13px; padding-top:1px}
+dl.facts dd{margin:0; min-width:0}
+.swatch{display:inline-block; width:.9em; height:.9em; border-radius:3px;
+  vertical-align:-.1em; margin-right:6px; box-shadow:inset 0 0 0 1px rgba(128,128,128,.35)}
+.mono{font-family:var(--mono); font-size:13px}
+
+.levels{display:grid; gap:6px}
+.level{display:grid; grid-template-columns:minmax(0,7em) minmax(0,1fr) 3.2em; gap:10px;
+  align-items:center}
+.level.single{grid-template-columns:minmax(0,1fr) 3.2em}
+.level .name{overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--soft)}
+.track{height:8px; border-radius:4px; background:var(--bar); overflow:hidden}
+.fill{height:100%; border-radius:4px; background:var(--soft); transition:width .6s}
+.level .pct{text-align:right}
+
+.fresh{position:relative; margin-top:6px}
+.fresh .band{display:flex; height:8px; border-radius:4px; overflow:hidden}
+.fresh .band div{height:100%}
+.band .b-fresh{background:var(--soft)}
+.band .b-fade{background:linear-gradient(to right,var(--soft),var(--bar))}
+.band .b-off{background:var(--bar)}
+.fresh .mark{position:absolute; top:-4px; width:3px; height:16px; border-radius:2px;
+  background:var(--ink); transform:translateX(-50%); transition:left .6s}
+.fresh .tick{position:absolute; top:0; width:2px; height:8px; background:var(--card)}
+.fresh .legend{margin-top:4px; font-size:12px; color:var(--faint)}
+
+.disclaimer{margin:14px 2px 0; font-size:13px; color:var(--faint)}
+
+.scroll{overflow-x:auto; -webkit-overflow-scrolling:touch; border:1px solid var(--rule);
+  border-radius:10px; background:var(--card)}
+table{border-collapse:collapse; width:100%; font-size:13px}
+th,td{padding:6px 10px; text-align:left; white-space:nowrap; border-bottom:1px solid var(--rule)}
+th{font-weight:600; color:var(--faint); font-size:12px; position:sticky; top:0; background:var(--card)}
+tr:last-child td{border-bottom:0}
+td.r,th.r{text-align:right}
+tr.off td{color:var(--faint)}
+td .flag{font-weight:600}
+td .flag.urgent{color:var(--alert)}
+button{font:inherit; font-size:13px; color:var(--ink); background:var(--card);
+  border:1px solid var(--rule); border-radius:8px; padding:6px 12px; margin-top:10px; cursor:pointer}
+
+.problems{list-style:none; margin:0; padding:0; display:grid; gap:6px}
+.problems li{padding:8px 12px; border:1px solid var(--rule); border-left:3px solid var(--note-rule);
+  border-radius:6px; background:var(--card); font-size:13px; overflow-wrap:anywhere}
+.problems li.error{border-left-color:var(--alert)}
+.problems .when{color:var(--faint); margin-right:8px}
+
+footer{margin-top:32px; font-size:13px; color:var(--faint)}
+footer p{margin:4px 0}
+
+@media (max-width:520px){
+  .hero{gap:18px}
+  .lamp{width:84px; height:84px}
+  .value{font-size:52px}
+  .arrow{font-size:30px}
+  .card{padding:16px}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>diabetes-light</h1>
+    <span id="contact" class="contact">connecting…</span>
+  </header>
+
+  <div id="notes" class="notes"></div>
+
+  <section id="view" class="card">
+    <div class="hero">
+      <div id="lamp" class="lamp dark" role="img" aria-label="light off"></div>
+      <div class="readout">
+        <div id="state" class="state">Waiting for the first cycle</div>
+        <div id="big" class="big dim">
+          <span id="value" class="value num">–</span>
+          <span id="arrow" class="arrow"></span>
+        </div>
+        <div id="sub" class="sub"></div>
+      </div>
+    </div>
+    <dl id="facts" class="facts hidden">
+      <dt>Reading age</dt>
+      <dd>
+        <span id="age" class="num"></span> <span id="newness" class="sub"></span>
+        <div id="fresh" class="fresh">
+          <div class="band"><div class="b-fresh"></div><div class="b-fade"></div><div class="b-off"></div></div>
+          <div class="mark"></div>
+          <div class="legend"></div>
+        </div>
+      </dd>
+      <dt>Taken</dt><dd id="taken" class="num"></dd>
+      <dt>Colour</dt><dd id="colour"></dd>
+      <dt>Brightness</dt><dd><div id="levels" class="levels"></div></dd>
+    </dl>
+  </section>
+  <p class="disclaimer">A convenience display, not an alarm. Keep your Dexcom app's alarms on.</p>
+
+  <section id="problems-section" class="hidden">
+    <h2>Recent warnings</h2>
+    <ul id="problems" class="problems"></ul>
+  </section>
+
+  <section id="history-section" class="hidden">
+    <h2>Recent cycles</h2>
+    <div class="scroll">
+      <table>
+        <thead><tr id="history-head"></tr></thead>
+        <tbody id="history"></tbody>
+      </table>
+    </div>
+    <button id="more" class="hidden" type="button"></button>
+  </section>
+
+  <footer id="footer"></footer>
+</div>
+
+<script>
+"use strict";
+const POLL_MS = 10000;
+const HISTORY_ROWS = 60;
+
+let boot = null, lastSeq = 0, cycles = [], problems = [], settings = null;
+let serverNow = 0, fetchedAt = 0, lastContact = 0, lost = false, showAll = false;
+
+const $ = id => document.getElementById(id);
+
+function el(tag, cls, text){
+  const node = document.createElement(tag);
+  if (cls) node.className = cls;
+  if (text !== undefined && text !== null) node.textContent = text;
+  return node;
+}
+
+function num(v){
+  if (v === null || v === undefined) return "";
+  return String(Math.round(v * 10) / 10);
+}
+
+function signed(v){
+  return (v > 0 ? "+" : "−") + num(Math.abs(v));
+}
+
+function dur(s){
+  s = Math.max(0, Math.round(s));
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.floor(s / 60) + "m " + String(s % 60).padStart(2, "0") + "s";
+  return Math.floor(s / 3600) + "h " + String(Math.floor(s / 60) % 60).padStart(2, "0") + "m";
+}
+
+function clock(t, seconds){
+  const opts = {hour:"2-digit", minute:"2-digit"};
+  if (seconds) opts.second = "2-digit";
+  return new Date(t * 1000).toLocaleTimeString([], opts);
+}
+
+// Server time now, extrapolated from the last response with the browser's own
+// monotonic clock, so a phone whose clock is off can't make a reading look
+// fresher or older than it is.
+function serverClock(){
+  return serverNow + (performance.now() - fetchedAt) / 1000;
+}
+
+async function poll(){
+  try {
+    const query = boot === null ? "" : "?after=" + lastSeq;
+    const res = await fetch("status.json" + query, {cache:"no-store"});
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    if (boot !== null && data.boot !== boot){
+      // The script restarted: its sequence numbers start again, and the
+      // history it holds is only what it has seen since.
+      boot = null; lastSeq = 0; cycles = [];
+      return poll();
+    }
+    boot = data.boot;
+    settings = data.settings;
+    problems = data.problems;
+    const grew = data.cycles.length > 0;
+    cycles.push(...data.cycles);
+    if (cycles.length > settings.history_size) cycles.splice(0, cycles.length - settings.history_size);
+    if (cycles.length) lastSeq = cycles[cycles.length - 1].seq;
+    serverNow = data.now;
+    fetchedAt = performance.now();
+    lastContact = Date.now();
+    lost = false;
+    if (grew) renderHistory();
+    renderProblems();
+    renderFooter();
+  } catch (err) {
+    lost = true;
+  }
+  renderLive();
+}
+
+function levelsOf(c){
+  return (c.levels || settings.groups.map(g => ({group:g.name, level:null})));
+}
+
+function renderLive(){
+  const contact = $("contact");
+  const notes = $("notes");
+  notes.replaceChildren();
+
+  if (lost){
+    contact.textContent = lastContact
+      ? "can't reach the script · last contact " + dur((Date.now() - lastContact) / 1000) + " ago"
+      : "can't reach the script";
+    contact.className = "contact lost";
+    notes.append(el("div", "note",
+      "This page can't reach diabetes-light, so what it shows is out of date. " +
+      "If the script has stopped, the bridge watchdog turns the lights off on its own."));
+  } else if (settings) {
+    contact.textContent = "live · checked " + dur((Date.now() - lastContact) / 1000) + " ago";
+    contact.className = "contact";
+  }
+  $("view").classList.toggle("lost-view", lost);
+  if (!settings) return;
+
+  const c = cycles[cycles.length - 1];
+  if (!c){
+    $("state").textContent = "Waiting for the first cycle";
+    return;
+  }
+
+  const sinceCycle = serverClock() - c.time;
+  const expected = settings.poll_seconds;
+  if (sinceCycle > expected * 2 + 30){
+    notes.append(el("div", "note",
+      "No cycle for " + dur(sinceCycle) + " (expected every " + dur(expected) + "). " +
+      "The script may be stuck." + (settings.watchdog
+        ? " The bridge watchdog switches the lights off " + num(settings.watchdog_minutes) +
+          " min after the last new reading."
+        : "")));
+  }
+
+  const age = c.age === undefined ? null : c.age + sinceCycle;
+  const staleSeconds = settings.stale_minutes * 60;
+  let state = c.state;
+  // Same rule as the light: once the reading passes STALE_MINUTES it is not
+  // shown as current, even if the next cycle hasn't happened yet.
+  if (state === "on" && age >= staleSeconds) state = "stale-now";
+  const on = state === "on" && !lost;
+
+  let label;
+  if (state === "on") label = "Lights on";
+  else if (state === "stale") label = "Stale — lights off";
+  else if (state === "stale-now") label = "Stale — lights off at the next cycle";
+  else label = "No reading yet — lights off";
+  const stateNode = $("state");
+  stateNode.replaceChildren(label);
+  if (lost) stateNode.prepend("Last known: ");
+  if (state === "on" && c.urgent){
+    stateNode.append(" · ", el("span", "urgent", "Urgent low"));
+  }
+
+  $("big").classList.toggle("dim", state !== "on");
+  $("value").textContent = c.value === undefined ? "–" : num(c.value);
+  $("arrow").textContent = c.trend || "";
+
+  const sub = [];
+  if (c.offset) sub.push("shown as " + num(c.shown) + " (" + signed(c.offset) + " for the arrow)");
+  if (c.fetch_failed) sub.push("Share didn't answer this cycle");
+  $("sub").textContent = sub.join(" · ");
+
+  const lamp = $("lamp");
+  const peak = Math.max(0, ...levelsOf(c).map(l => l.level || 0));
+  if (on && c.hex){
+    lamp.classList.remove("dark");
+    lamp.style.backgroundColor = c.hex;
+    lamp.style.filter = "brightness(" + (0.35 + 0.65 * peak / 100).toFixed(2) + ")";
+    lamp.style.boxShadow = "0 0 " + Math.round(8 + 40 * peak / 100) + "px " + c.hex;
+    lamp.setAttribute("aria-label", "light on, " + c.colour + ", " + Math.round(peak) + "%");
+  } else {
+    lamp.classList.add("dark");
+    lamp.style.backgroundColor = lamp.style.filter = lamp.style.boxShadow = "";
+    lamp.setAttribute("aria-label", "light off");
+  }
+
+  if (c.value === undefined){
+    $("facts").classList.add("hidden");
+    document.title = "no reading · diabetes-light";
+    setIcon(null);
+    return;
+  }
+  $("facts").classList.remove("hidden");
+  $("age").textContent = dur(age) + " old";
+  $("newness").textContent = c.new ? "" : "· no new reading last cycle";
+  $("taken").textContent = clock(c.reading_time, false);
+  renderFreshness(age);
+
+  const colour = $("colour");
+  colour.replaceChildren();
+  if (c.hex){
+    const sw = el("span", "swatch");
+    sw.style.backgroundColor = c.hex;
+    colour.append(sw, el("span", "mono", c.hex), " " + c.colour);
+    if (state !== "on") colour.append(el("span", "sub", " · not showing"));
+  } else {
+    colour.append(el("span", "sub", "none — lights off"));
+  }
+
+  const levels = $("levels");
+  levels.replaceChildren();
+  for (const l of levelsOf(c)){
+    const row = el("div", settings.named_groups ? "level" : "level single");
+    if (settings.named_groups) row.append(el("span", "name", l.group));
+    const track = el("div", "track");
+    const fill = el("div", "fill");
+    const level = state === "on" ? l.level : null;
+    fill.style.width = (level || 0) + "%";
+    track.append(fill);
+    row.append(track, el("span", "pct num", level === null ? "off" : Math.round(level) + "%"));
+    levels.append(row);
+  }
+
+  document.title = (on ? num(c.value) + " " + (c.trend || "") : "off") + " · diabetes-light";
+  setIcon(on ? c.hex : null);
+}
+
+function renderFreshness(age){
+  const fresh = settings.fresh_minutes * 60, stale = settings.stale_minutes * 60;
+  const end = settings.watchdog ? Math.max(settings.watchdog_minutes * 60, stale * 1.1) : stale * 1.25;
+  const pct = s => (100 * Math.min(s, end) / end);
+  const band = $("fresh").querySelectorAll(".band div");
+  band[0].style.width = pct(fresh) + "%";
+  band[1].style.width = (pct(stale) - pct(fresh)) + "%";
+  band[2].style.width = (100 - pct(stale)) + "%";
+  const box = $("fresh");
+  box.querySelector(".mark").style.left = pct(age) + "%";
+  box.querySelectorAll(".tick").forEach(t => t.remove());
+  if (settings.watchdog){
+    const tick = el("div", "tick");
+    tick.style.left = pct(settings.watchdog_minutes * 60) + "%";
+    box.append(tick);
+  }
+  // Labels get a line of their own: placed on the bar, "off 13m" and
+  // "watchdog 15m" sit two minutes apart and print on top of each other.
+  box.querySelector(".legend").textContent =
+    "full to " + num(settings.fresh_minutes) + " min · fades to " +
+    num(settings.stale_minutes) + " min, then off" +
+    (settings.watchdog ? " · bridge watchdog at " + num(settings.watchdog_minutes) + " min" : "");
+}
+
+function renderHistory(){
+  if (!settings) return;
+  $("history-section").classList.toggle("hidden", cycles.length === 0);
+  // One brightness column per group, headed by its name, so a row reads like
+  // the log line's NN% name cells without repeating the names on every row.
+  const head = $("history-head");
+  head.replaceChildren();
+  const cols = [["Time"], ["Glucose", "r"], ["Trend"], ["Adjusted"], ["Age", "r"], [""], ["Colour"]];
+  for (const g of settings.groups) cols.push([settings.named_groups ? g.name : "Brightness", "r"]);
+  cols.push([""]);
+  for (const [text, cls] of cols) head.append(el("th", cls, text));
+  const body = $("history");
+  body.replaceChildren();
+  const rows = cycles.slice().reverse();
+  const shown = showAll ? rows : rows.slice(0, HISTORY_ROWS);
+  for (const c of shown){
+    const tr = el("tr", c.state === "on" ? null : "off");
+    tr.append(el("td", "num", clock(c.time, true)));
+    tr.append(el("td", "r num", c.value === undefined ? "" : num(c.value)));
+    tr.append(el("td", null, c.trend || ""));
+    tr.append(el("td", "num", c.offset ? signed(c.offset) + " → " + num(c.shown) : ""));
+    tr.append(el("td", "r num", c.age === undefined ? "" : dur(c.age)));
+    tr.append(el("td", null, c.state === "waiting" ? "" : (c.new ? "new" : "repeat")));
+    const colour = el("td");
+    if (c.hex){
+      const sw = el("span", "swatch");
+      sw.style.backgroundColor = c.hex;
+      colour.append(sw, el("span", "mono", c.hex), " " + c.colour);
+    }
+    tr.append(colour);
+    for (const l of levelsOf(c)){
+      const level = c.state === "on" ? l.level : null;
+      tr.append(el("td", "r num", level === null ? "off" : Math.round(level) + "%"));
+    }
+    const flags = el("td");
+    if (c.state === "on" && c.urgent) flags.append(el("span", "flag urgent", "URGENT LOW"));
+    if (c.state === "stale") flags.append(el("span", "flag", "STALE"));
+    if (c.state === "waiting") flags.append(el("span", "flag", "no reading yet"));
+    if (c.fetch_failed) flags.append((flags.childNodes.length ? " · " : "") + "Share fetch failed");
+    tr.append(flags);
+    body.append(tr);
+  }
+  const more = $("more");
+  more.classList.toggle("hidden", rows.length <= HISTORY_ROWS);
+  more.textContent = showAll ? "Show the last " + HISTORY_ROWS : "Show all " + rows.length;
+}
+
+function renderProblems(){
+  $("problems-section").classList.toggle("hidden", problems.length === 0);
+  const list = $("problems");
+  list.replaceChildren();
+  for (const p of problems.slice().reverse()){
+    const li = el("li", p.level === "WARNING" ? null : "error");
+    li.append(el("span", "when num", clock(p.time, true)), p.message);
+    list.append(li);
+  }
+}
+
+function renderFooter(){
+  const s = settings;
+  const parts = [
+    "Polls every " + s.poll_seconds + "s",
+    "fades after " + num(s.fresh_minutes) + " min",
+    "off at " + num(s.stale_minutes) + " min",
+    s.watchdog ? "watchdog " + num(s.watchdog_minutes) + " min" : "watchdog off",
+    "urgent at " + num(s.urgent_below) + " and under",
+    "trend adjustment " + (s.trend_adjust ? "on" : "off"),
+  ];
+  const footer = $("footer");
+  footer.replaceChildren(el("p", null, parts.join(" · ")));
+  if (s.named_groups){
+    footer.append(el("p", null, s.groups.map(g =>
+      g.name + ": " + num(g.max) + "% → " + num(g.min) + "%, " + num(g.urgent_level) + "% urgent"
+    ).join(" · ")));
+  }
+  footer.append(el("p", null, "Running since " + new Date(boot * 1000).toLocaleString() +
+    ". History is kept in memory for " + dur(s.history_size * s.poll_seconds) + "."));
+}
+
+function setIcon(hex){
+  const fill = hex || "#555";
+  const svg = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'>" +
+    "<circle cx='8' cy='8' r='7' fill='" + fill + "'/></svg>";
+  $("icon").href = "data:image/svg+xml," + encodeURIComponent(svg);
+}
+
+$("more").addEventListener("click", () => { showAll = !showAll; renderHistory(); });
+
+poll();
+setInterval(poll, POLL_MS);
+setInterval(renderLive, 1000);
+</script>
+</body>
+</html>
+"""
 
 
 if __name__ == "__main__":

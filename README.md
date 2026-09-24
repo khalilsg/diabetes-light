@@ -185,6 +185,7 @@ FRESH_MINUTES=6
 STALE_MINUTES=13    # must stay below WATCHDOG_MINUTES
 WATCHDOG=1
 WATCHDOG_MINUTES=15
+STATUS_PORT=0       # set a port for the status page — 7a
 ```
 
 On Linux: `chmod 600 diabetes_light.env`. On Windows, restrict it to your user in
@@ -827,6 +828,72 @@ MacBook you carry around, it also leaves the network whenever you do. A Mac mini
 or an always-docked machine is fine; anything you pick up is not.
 
 **Test a real reboot.** This is the step people assume works and don't check.
+
+## 7a. A status page (optional)
+
+Everything the per-cycle log line says, as a web page you can open on your
+phone: the reading and its arrow, what the arrow shifted it to, how old it is,
+the colour and name sent to the bulbs, each room's brightness, and any urgent
+or stale flag. Below that, recent warnings (the things that would land in
+`err.log`) and the last 12 hours of cycles as a table.
+
+Turn it on in `diabetes_light.env` and restart the service:
+
+```
+STATUS_PORT=8768
+```
+
+At startup it logs `Status page on http://127.0.0.1:8768/`. Open that on the
+same machine to check it.
+
+### What it won't do
+
+It follows the light's rule: **when in doubt, dark.**
+
+- Once a reading passes `STALE_MINUTES` the page shows it as stale, even if
+  the next cycle hasn't run yet. It keeps counting the reading's age itself,
+  using the server's clock rather than your phone's.
+- If the page can't reach the script, it says so in red and greys everything
+  out. It doesn't keep showing the last colour as though it were current.
+- If the script stops completing cycles, the page says that too.
+- The history lives in memory, so a restart clears it. The page never shows a
+  reading this run of the script didn't see.
+
+It's read-only and has no login. There is nothing on it you can change.
+
+### HTTPS, and reaching it from your phone
+
+The page only ever listens on `127.0.0.1`, using plain HTTP. No setting
+changes that. It shows health data and has no password, so nothing else
+should be able to reach it unless you put something in front of it on purpose.
+
+That something is [Tailscale](https://tailscale.com). `tailscale serve` takes
+the local port and serves it over HTTPS on your tailnet, with a real
+certificate. Only your own devices can reach it:
+
+```bash
+tailscale serve --bg --https=8446 http://127.0.0.1:8768
+```
+
+The page is now at `https://<machine>.<tailnet>.ts.net:8446/` on any device
+signed into your tailnet. On Linux, `tailscale serve` needs `sudo` unless
+you've run `sudo tailscale set --operator=$USER` once. On Windows and macOS,
+run it from a terminal as the user who installed Tailscale. The setting
+survives reboots. To remove it:
+
+```bash
+tailscale serve --https=8446 off
+```
+
+Why not HTTPS inside the script? A self-signed certificate means clicking
+through a browser warning every time, and that teaches you to ignore the
+warnings. Tailscale's certificates are real ones, and you don't have to renew
+them.
+
+Any free ports will do. 8768 and 8446 were chosen to sit next to other local
+boards without clashing. If `STATUS_PORT` is already in use, the script logs a
+warning and keeps driving the lights without the page. It won't stop the
+lights over a problem with the page.
 
 ## 8. The kill switch
 

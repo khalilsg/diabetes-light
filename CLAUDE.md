@@ -36,6 +36,11 @@ Dexcom sensor -> phone -> Dexcom Share cloud -> this script -> Hue bridge (LAN)
 - **Hue side:** CLIP v2 over HTTPS on the LAN, self-signed cert, no cloud.
   The watchdog uses the legacy **v1** API because v2 has no equivalent to
   timer schedules.
+- **Status page (optional, `STATUS_PORT`):** a stdlib `ThreadingHTTPServer` on
+  a daemon thread, serving one self-contained HTML page (`STATUS_PAGE`, at the
+  bottom of the file) and `/status.json`. `Runner.tick()` hands a
+  `StatusBoard` the same facts the log line prints, via `_report()`. HTTPS is
+  `tailscale serve` in front of it, never TLS in-process.
 
 ## Invariants — don't break these
 
@@ -69,6 +74,17 @@ light going dark while another glows on the same dead reading would wreck what
 `prepare_light_groups` rejects those keys by name rather than ignoring them.
 A light may only be in one group — two groups asking for different brightness
 on one bulb has no answer, so it's a startup error.
+
+**The status page reports, it never decides.** It shows what `tick()` sent
+and computes no colour or level of its own, so it can't disagree with the
+light. It fails dark like the light does: it re-applies `STALE_MINUTES` between
+cycles (ageing on the server's clock, not the phone's), greys out when it
+loses contact, and flags a loop that has stopped cycling. It binds `127.0.0.1`
+only, with no flag to change that, because it serves health data with no auth.
+Warnings shown on it have the Hue app key and Dexcom password redacted (a
+failed v1 call's URL contains the key). Server values go into the DOM via
+`textContent` only. A busy port logs a warning and the lights carry on without
+the page.
 
 **No green in the default palette.** Green reads as "fine" to anyone who has
 used a CGM app. The high side deliberately routes through cream and white to
@@ -120,10 +136,18 @@ For logic changes, import the module and call the pure functions directly
 `brightness_for_age` takes a `LightGroup`, but anything carrying the same six
 brightness attributes works.
 
+For the status page, build a `Runner` with `HueBridge` stubbed out and
+`runner.dexcom` / `runner.connect_dexcom` replaced by fakes, attach a
+`StatusBoard`, call `tick()` a few times and `start_status_page()`. Check it at
+phone width in both colour schemes, and in the stale and lost-contact states.
+
 ## Logging
 
 Routine output to stdout, warnings and errors to stderr, no overlap. An empty
 error log is a health signal, so don't log routine things at WARNING.
+
+The status page's HTTP server logs requests at DEBUG only. A request line at
+INFO would land on stdout between two cycle lines and break the columns.
 
 The per-cycle line is the primary debugging tool and should stay parseable.
 Every field is padded to a fixed width so a run of lines reads as columns and
