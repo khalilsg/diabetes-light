@@ -810,14 +810,111 @@ def format_levels(levels, width=0):
     )
 
 
+def format_duration(seconds):
+    """'45s', '12 min', '2h', '6h 37m' — for log lines, where seconds rarely matter."""
+    seconds = max(int(round(seconds)), 0)
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes} min"
+    if minutes % 60 == 0:
+        return f"{minutes // 60}h"
+    return f"{minutes // 60}h {minutes % 60:02d}m"
+
+
+# --------------------------------------------------------------------------
+# Failures
+# --------------------------------------------------------------------------
+# Share drops the odd request and the bridge times out now and then. Nearly
+# every time, the next cycle works. Logging each of those as a warning buried
+# the few that needed doing something about — and one six-hour network outage
+# wrote two thousand near-identical lines to err.log, pushing everything else
+# off the status page.
+#
+# So a failure starts out as an info line on stdout. It becomes a warning only
+# once it has lasted WARN_AFTER_MINUTES, and then it warns once, again if the
+# error changes, and once more when it clears. err.log stays empty through
+# blips, and an outage reads as two lines: when it started and when it ended.
+
+# One missed Dexcom reading, and well inside STALE_MINUTES: an outage that is
+# going to turn the light off is on the status page before the light goes dark
+# because of it.
+WARN_AFTER_MINUTES = 5
+
+
+class Trouble:
+    """Turns a run of failures into one warning, and its end into another.
+
+    Each thing that can fail has a key — "dexcom", "bridge", a light — and
+    every attempt reports in with failed() or ok(). Called from the loop's
+    thread only.
+    """
+
+    def __init__(self, grace_seconds=WARN_AFTER_MINUTES * 60):
+        self.grace = grace_seconds
+        self._streaks = {}
+
+    def failed(self, key, subject, doing, exc):
+        """One failed attempt. `subject` names the thing ("Dexcom Share"),
+        `doing` what was being tried ("fetch a reading from Dexcom Share")."""
+        now = time.time()
+        streak = self._streaks.get(key)
+        first = streak is None
+        if first:
+            streak = self._streaks[key] = {
+                "since": now, "tries": 0, "warned": False, "kind": None,
+            }
+        streak["tries"] += 1
+        lasted = now - streak["since"]
+        # The exception's type stands in for "what went wrong". Its text
+        # can't: it often carries a URL or a count that differs every time.
+        kind = type(exc).__name__
+
+        if not streak["warned"] and lasted >= self.grace:
+            streak["warned"], streak["kind"] = True, kind
+            log.warning(
+                "%s has been failing for %s (%d tries in a row). Could not %s: %s",
+                subject, format_duration(lasted), streak["tries"], doing, exc,
+            )
+        elif streak["warned"] and kind != streak["kind"]:
+            # Say so when the error changes mid-outage: a network that comes
+            # back to a rejected password is a new problem, not the same one.
+            streak["kind"] = kind
+            log.warning(
+                "%s is still failing after %s, now differently. Could not %s: %s",
+                subject, format_duration(lasted), doing, exc,
+            )
+        elif first:
+            log.info("Could not %s: %s", doing, exc)
+        else:
+            log.debug("Could not %s (try %d): %s", doing, streak["tries"], exc)
+
+    def ok(self, key, subject):
+        """One attempt that worked. Ends the streak, if there was one."""
+        streak = self._streaks.pop(key, None)
+        if streak is None:
+            return
+        lasted = format_duration(time.time() - streak["since"])
+        if streak["warned"]:
+            # A warning, though it's good news: the warning that opened this
+            # outage is in err.log, and this is what closes it. `resolved`
+            # lets the status page show it as the all-clear it is.
+            log.warning("%s is working again, after failing for %s.",
+                        subject, lasted, extra={"resolved": True})
+        else:
+            log.debug("%s is working again after %s.", subject, lasted)
+
+
 # --------------------------------------------------------------------------
 # Hue bridge
 # --------------------------------------------------------------------------
 
 class HueBridge:
-    def __init__(self, ip, app_key):
+    def __init__(self, ip, app_key, trouble=None):
         self.ip = ip
         self.app_key = app_key
+        self.trouble = trouble or Trouble()
         self.session = requests.Session()
         self.session.verify = False
         self.session.headers.update({"hue-application-key": app_key})
@@ -878,6 +975,32 @@ class HueBridge:
         ]
         return max(floors) if floors else None
 
+    def _each_light(self, light_ids, key, doing, action):
+        """Run `action` on each light. One failure doesn't stop the others.
+
+        Every outcome goes to `trouble`. Not reaching the bridge at all is one
+        problem, not one per light per call, so it's tracked once under
+        "bridge" — an outage is then a single warning rather than four a
+        minute. Anything else belongs to the light: a bulb the bridge can't
+        find, a request it refused, a reply that never came.
+        """
+        for light_id in light_ids:
+            try:
+                action(light_id)
+            except requests.ConnectionError as exc:
+                self.trouble.failed(
+                    "bridge", "The Hue bridge",
+                    f"reach the Hue bridge at {self.ip}", exc,
+                )
+            except Exception as exc:
+                self.trouble.failed(
+                    (key, light_id), f"Light {light_id}",
+                    f"{doing} light {light_id}", exc,
+                )
+            else:
+                self.trouble.ok("bridge", "The Hue bridge")
+                self.trouble.ok((key, light_id), f"Light {light_id}")
+
     def set_color(self, light_ids, xy, brightness):
         """Paint every light. One failure doesn't stop the others."""
         payload = {
@@ -885,29 +1008,28 @@ class HueBridge:
             "dimming": {"brightness": round(brightness, 1)},
             "color": {"xy": {"x": round(xy[0], 4), "y": round(xy[1], 4)}},
         }
-        for light_id in light_ids:
+
+        def paint(light_id):
             body = dict(payload)
             # The Hue Go's physical button can start a built-in effect that
             # would otherwise ignore our colour until someone presses it again.
             if self.supports_effects.get(light_id):
                 body["effects"] = {"effect": "no_effect"}
-            try:
-                response = self.session.put(
-                    self._v2(f"light/{light_id}"), json=body, timeout=10
-                )
-                response.raise_for_status()
-            except Exception as exc:
-                log.warning("Could not update light %s: %s", light_id, exc)
+            response = self.session.put(
+                self._v2(f"light/{light_id}"), json=body, timeout=10
+            )
+            response.raise_for_status()
+
+        self._each_light(light_ids, "light", "update", paint)
 
     def turn_off(self, light_ids):
-        for light_id in light_ids:
-            try:
-                response = self.session.put(
-                    self._v2(f"light/{light_id}"), json={"on": {"on": False}}, timeout=10
-                )
-                response.raise_for_status()
-            except Exception as exc:
-                log.warning("Could not turn off light %s: %s", light_id, exc)
+        def switch_off(light_id):
+            response = self.session.put(
+                self._v2(f"light/{light_id}"), json={"on": {"on": False}}, timeout=10
+            )
+            response.raise_for_status()
+
+        self._each_light(light_ids, "light", "turn off", switch_off)
 
     # --- dead-man's switch, v1 API ---------------------------------------
     # One-shot timer schedules living on the bridge, one per light. Re-armed on
@@ -960,17 +1082,17 @@ class HueBridge:
         return None
 
     def arm_watchdog(self, light_ids, minutes):
-        """Create or reset each timer. Writing localtime restarts the countdown."""
-        for light_id in light_ids:
-            if not self.v1_ids.get(light_id):
-                log.warning(
-                    "Light %s has no v1 id; the watchdog can't cover it.", light_id
-                )
-                continue
-            try:
-                self._arm_one(light_id, minutes)
-            except Exception as exc:
-                log.warning("Could not arm watchdog for light %s: %s", light_id, exc)
+        """Create or reset each timer. Writing localtime restarts the countdown.
+
+        Lights with no v1 id are skipped. Runner warns about those once at
+        startup; this runs on every new reading, and saying it here meant
+        saying it every five minutes forever.
+        """
+        self._each_light(
+            [light_id for light_id in light_ids if self.v1_ids.get(light_id)],
+            "watchdog", "arm the watchdog for",
+            lambda light_id: self._arm_one(light_id, minutes),
+        )
 
     def _arm_one(self, light_id, minutes, retry=True):
         body = self._watchdog_body(light_id, minutes)
@@ -1003,16 +1125,15 @@ class HueBridge:
         rather than correctness — it stops a redundant write landing minutes
         after we've already done the same thing.
         """
-        for light_id in light_ids:
-            try:
-                sched_id = self._find_watchdog(light_id)
-                if sched_id:
-                    self.session.put(
-                        self._v1(f"schedules/{sched_id}"),
-                        json={"status": "disabled"}, timeout=10,
-                    )
-            except Exception as exc:
-                log.warning("Could not disarm watchdog for light %s: %s", light_id, exc)
+        def disarm(light_id):
+            sched_id = self._find_watchdog(light_id)
+            if sched_id:
+                self.session.put(
+                    self._v1(f"schedules/{sched_id}"),
+                    json={"status": "disabled"}, timeout=10,
+                )
+
+        self._each_light(light_ids, "watchdog", "disarm the watchdog for", disarm)
 
 
 def discover_bridge():
@@ -1052,8 +1173,89 @@ def reading_timestamp(reading):
 
 def reading_age_seconds(reading):
     """Age of a reading in seconds."""
-    age = (datetime.now(timezone.utc) - reading_timestamp(reading)).total_seconds()
-    return max(age, 0.0)
+    return seconds_since(reading_timestamp(reading))
+
+
+def seconds_since(stamp):
+    """Seconds from an aware timestamp to now, never negative."""
+    return max((datetime.now(timezone.utc) - stamp).total_seconds(), 0.0)
+
+
+# --------------------------------------------------------------------------
+# Snooze
+# --------------------------------------------------------------------------
+# For when the CGM is wrong and the light is shouting about it — the classic
+# being a compression low at 3am that has the bedside lamp at full brightness
+# magenta. Snoozing turns the lights off for a while.
+#
+# Off, rather than dim or some new look, because off already means "no reading
+# you can trust", and that is exactly what a snooze says: I know this reading
+# is wrong, stop showing it. Every group at once, since a snooze is about the
+# data rather than a room. It runs for a fixed time — it doesn't end early when
+# the reading recovers, because a sensor that is wrong tends to stay wrong for
+# a while and the light flicking back on at 72 and off again at 68 is the
+# thing being snoozed.
+#
+# Everything else carries on underneath: readings are fetched and logged, the
+# watchdog is armed as usual, and when the snooze ends the light shows the
+# current reading straight away. It's kept in memory only, so a restart ends
+# it; the worst a forgotten snooze can do is last SNOOZE_MAX_MINUTES.
+
+# What the status page offers, in minutes.
+SNOOZE_CHOICES = (30, 60, 120, 240)
+SNOOZE_MAX_MINUTES = 12 * 60
+
+
+class Snooze:
+    """Whether the lights are snoozed, and until when.
+
+    Set from the status page's threads and read by the loop, hence the lock.
+    `changed` wakes the loop so the light follows within a second or so of the
+    tap, rather than at the next poll.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._until = None
+        self.changed = threading.Event()
+
+    def start(self, minutes):
+        until = time.time() + minutes * 60
+        with self._lock:
+            self._until = until
+        log.info("Snoozed for %s, until %s. Lights off.",
+                 format_duration(minutes * 60), time.strftime("%H:%M", time.localtime(until)))
+        self.changed.set()
+        return until
+
+    def cancel(self):
+        with self._lock:
+            was, self._until = self._until, None
+        if was is not None:
+            log.info("Snooze canceled. Showing readings again.")
+            self.changed.set()
+
+    def until(self):
+        """When the snooze ends, or None if there isn't one running."""
+        with self._lock:
+            if self._until is not None and time.time() < self._until:
+                return self._until
+            return None
+
+    def due(self):
+        """True once a snooze has run out but the loop hasn't noticed yet."""
+        with self._lock:
+            return self._until is not None and time.time() >= self._until
+
+    def check(self):
+        """For the loop: like until(), but clears a snooze that has run out,
+        and logs that it ended."""
+        with self._lock:
+            if self._until is None or time.time() < self._until:
+                return self._until
+            self._until = None
+        log.info("Snooze over. Showing readings again.")
+        return None
 
 
 # --------------------------------------------------------------------------
@@ -1068,6 +1270,12 @@ def reading_age_seconds(reading):
 # are this machine and whatever you deliberately put in front of it — in
 # practice `tailscale serve`, which also supplies a real HTTPS certificate.
 # A self-signed cert here would only teach you to click through warnings.
+#
+# The one thing it can change is the snooze, and even that only asks: it sets
+# a deadline on the Snooze, and the loop decides what the lights do about it.
+# The request has to carry a custom header, which a page on another site can't
+# add without a CORS preflight that this server never approves, so a link or a
+# hidden form elsewhere can't switch your light off.
 #
 # History is kept in memory. A restart starts it again, which is honest: the
 # page never shows a reading this process didn't see.
@@ -1092,9 +1300,11 @@ class RecentProblems(logging.Handler):
             message = record.getMessage()
         except Exception:
             message = str(record.msg)
-        self.items.append(
-            {"time": record.created, "level": record.levelname, "message": message}
-        )
+        self.items.append({
+            "time": record.created, "level": record.levelname, "message": message,
+            # Set by Trouble.ok() on the line that closes an outage.
+            "resolved": bool(getattr(record, "resolved", False)),
+        })
 
     def snapshot(self):
         self.acquire()
@@ -1110,8 +1320,11 @@ class StatusBoard:
     Written by the loop, read by the web server's threads, hence the lock.
     """
 
-    def __init__(self, cfg, problems):
+    def __init__(self, cfg, problems, snooze=None):
         self.problems = problems
+        # The loop's Snooze, which the page may set. None means no snooze
+        # controls, and the endpoint refuses.
+        self.snooze = snooze
         self.boot = time.time()
         self._lock = threading.Lock()
         self._seq = 0
@@ -1143,6 +1356,7 @@ class StatusBoard:
                 for group in cfg.groups
             ],
             "history_size": self.history_size,
+            "snooze_choices": list(SNOOZE_CHOICES) if snooze else [],
         }
 
     def record(self, cycle):
@@ -1172,6 +1386,9 @@ class StatusBoard:
         return {
             "now": time.time(), "boot": self.boot, "settings": self.settings,
             "cycles": cycles, "problems": problems,
+            # Live rather than per cycle, so a tap shows up on the next poll
+            # even before the loop has run a cycle with it.
+            "snooze_until": self.snooze.until() if self.snooze else None,
         }
 
 
@@ -1223,11 +1440,51 @@ def make_status_handler(board):
         do_HEAD = do_GET  # noqa: N815
 
         def _refuse(self):
-            # Read-only by construction: nothing on this page changes anything.
+            # Including OPTIONS, which is what makes the custom header below
+            # work: a cross-site request carrying it needs a preflight, and
+            # this answer has no CORS headers in it, so the browser gives up.
             self._send(405, b"405 Method Not Allowed\n", "text/plain; charset=utf-8",
                        {"Allow": "GET, HEAD"})
 
-        do_POST = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = _refuse  # noqa: N815
+        do_PUT = do_DELETE = do_PATCH = do_OPTIONS = _refuse  # noqa: N815
+
+        def _reply(self, code, payload):
+            body = json.dumps(payload).encode("utf-8")
+            self._send(code, body, "application/json")
+
+        def do_POST(self):  # noqa: N802
+            """POST /snooze {"minutes": 60} starts a snooze; 0 cancels it.
+
+            The only write the page has. Everything about what the lights do
+            stays with the loop; this only moves a deadline.
+            """
+            if urlsplit(self.path).path != "/snooze" or board.snooze is None:
+                return self._send(404, b"404 Not Found\n", "text/plain; charset=utf-8")
+            # A form on another site can POST here, but it can't set a custom
+            # header — and fetch() can only by asking first, which fails.
+            # Sec-Fetch-Site, where the browser sends it, is a second check
+            # on the same thing.
+            if (self.headers.get("X-Diabetes-Light") != "1"
+                    or self.headers.get("Sec-Fetch-Site", "same-origin") != "same-origin"):
+                return self._reply(403, {"error": "cross-site request refused"})
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                if not 0 < length <= 256:
+                    raise ValueError("bad length")
+                minutes = float(json.loads(self.rfile.read(length))["minutes"])
+            except (ValueError, KeyError, TypeError):
+                return self._reply(400, {"error": 'expected {"minutes": N}'})
+
+            if minutes == 0:
+                board.snooze.cancel()
+            elif 0 < minutes <= SNOOZE_MAX_MINUTES:
+                board.snooze.start(minutes)
+            else:
+                # Also catches NaN and infinity, which json.loads accepts.
+                return self._reply(400, {
+                    "error": f"minutes must be 0 to cancel, or up to {SNOOZE_MAX_MINUTES}",
+                })
+            return self._reply(200, {"snooze_until": board.snooze.until()})
 
         def log_message(self, format, *args):  # noqa: A002
             # Never stdout at INFO: that stream is the per-cycle log, and a
@@ -1268,8 +1525,18 @@ class Runner:
     def __init__(self, cfg):
         self.cfg = cfg
         self.running = True
-        self.bridge = HueBridge(cfg.bridge_ip, cfg.app_key)
+        # One tracker for Share and the bridge alike, so they follow the same
+        # rule about when a failure is worth a warning.
+        self.trouble = Trouble()
+        self.snooze = Snooze()
+        self.bridge = HueBridge(cfg.bridge_ip, cfg.app_key, self.trouble)
         self.bridge.inspect_lights(cfg.light_ids)
+        if cfg.watchdog:
+            for light_id in cfg.light_ids:
+                if not self.bridge.v1_ids.get(light_id):
+                    log.warning(
+                        "Light %s has no v1 id; the watchdog can't cover it.", light_id
+                    )
         if cfg.named_groups:
             for group in cfg.groups:
                 log.info(
@@ -1356,6 +1623,9 @@ class Runner:
 
     def tick(self):
         cfg = self.cfg
+        # Read once, up front, so the whole cycle agrees on it — and so the
+        # "snooze over" line lands before this cycle's line rather than after.
+        snoozed_until = self.snooze.check()
         try:
             if self.dexcom is None:
                 self.connect_dexcom()
@@ -1364,9 +1634,14 @@ class Runner:
             # Sessions expire and the Share API is occasionally moody. Drop the
             # client so the next tick reconnects, and fall through to ageing
             # out the last known reading rather than freezing the light.
-            log.warning("Dexcom fetch failed (%s). Will reconnect.", exc)
+            self.trouble.failed("dexcom", "Dexcom Share",
+                                "fetch a reading from Dexcom Share", exc)
             self.dexcom = None
             reading = None
+        else:
+            # No reading at all (a sensor warming up) still counts: Share
+            # answered, and had nothing to say.
+            self.trouble.ok("dexcom", "Dexcom Share")
 
         is_new = False
         trend = ""
@@ -1386,8 +1661,12 @@ class Runner:
                 trend_offset(reading, cfg.trend_offsets),
             )
         elif self.last_good is not None:
-            value, age, offset = self.last_good
-            self.last_good = (value, age + cfg.poll_seconds, offset)
+            # Age it by the clock, from the reading's own timestamp. Adding one
+            # poll interval per cycle got it wrong both ways: short when a
+            # cycle ran long on timeouts — making old data look fresher than
+            # it is — and long when a snooze tap ran a cycle early.
+            value, _, offset = self.last_good
+            self.last_good = (value, seconds_since(self.last_good_stamp), offset)
 
         if is_new and cfg.watchdog:
             self.bridge.arm_watchdog(cfg.light_ids, cfg.watchdog_minutes)
@@ -1439,6 +1718,24 @@ class Runner:
 
         rgb = glucose_to_rgb(shown, cfg.stops)
         urgent = shown <= cfg.urgent_below
+        if snoozed_until is not None:
+            # Below staleness, so a snoozed stale reading still reports as
+            # stale — that's the truer of the two. The color is logged anyway,
+            # so you can see afterwards what the snooze was hiding.
+            log.info(
+                "Glucose %3s %-2s %s | %4.0fs old %s | %s %-14s | SNOOZED until %s, lights off",
+                value, trend, adjustment, age, repeat,
+                rgb_to_hex(rgb), f"[{rgb_to_name(rgb)}]",
+                time.strftime("%H:%M", time.localtime(snoozed_until)),
+            )
+            self._report(
+                "snoozed", hex=rgb_to_hex(rgb), colour=rgb_to_name(rgb), urgent=urgent,
+                levels=[{"group": group.name, "level": level} for group, level in levels],
+                **facts,
+            )
+            self.bridge.turn_off(cfg.light_ids)
+            return
+
         log.info(
             "Glucose %3s %-2s %s | %4.0fs old %s | %s %-14s | %s%s",
             value, trend, adjustment, age, repeat,
@@ -1466,7 +1763,8 @@ class Runner:
 
         Called before the lights are painted, like the log line, so a bridge
         that hangs doesn't hold back the page. `state` is what the lights were
-        told: "on", "stale" (off) or "waiting" (off, nothing read yet).
+        told: "on", "stale" (off), "snoozed" (off, by request) or "waiting"
+        (off, nothing read yet).
         """
         if self.board is not None:
             self.board.record(dict(facts, state=state, time=time.time()))
@@ -1475,6 +1773,9 @@ class Runner:
         signal.signal(signal.SIGTERM, self.stop)
         signal.signal(signal.SIGINT, self.stop)
         while self.running:
+            # Cleared before the cycle rather than after, so a tap that lands
+            # mid-cycle still gets a cycle of its own straight afterwards.
+            self.snooze.changed.clear()
             try:
                 self.tick()
             except Exception as exc:
@@ -1486,7 +1787,11 @@ class Runner:
             for _ in range(self.cfg.poll_seconds):
                 if not self.running:
                     return
-                time.sleep(1)
+                # A snooze starting, being canceled or running out changes the
+                # light now, not up to a poll interval later. The wait is in
+                # one-second steps so a signal still stops this promptly.
+                if self.snooze.changed.wait(1) or self.snooze.due():
+                    break
 
 
 def main():
@@ -1686,7 +1991,7 @@ def main():
 
     # Not for --once: the page would be gone before anyone could load it.
     if cfg.status_port and not args.once:
-        runner.board = StatusBoard(cfg, problems)
+        runner.board = StatusBoard(cfg, problems, runner.snooze)
         start_status_page(runner.board, cfg.status_port)
 
     runner.run(once=args.once)
@@ -1797,6 +2102,17 @@ dl.facts dd{margin:0; min-width:0}
 .fresh .tick{position:absolute; top:0; width:2px; height:8px; background:var(--card)}
 .fresh .legend{margin-top:4px; font-size:12px; color:var(--faint)}
 
+.snooze{display:flex; align-items:center; flex-wrap:wrap; gap:8px 12px; margin-top:12px;
+  padding:10px 14px; border:1px solid var(--rule); border-radius:10px}
+.snooze.on{background:var(--note-bg); border-color:var(--note-rule); color:var(--note-ink)}
+.snooze.lost{opacity:.45}
+.snooze .label{font-size:14px; color:var(--soft)}
+.snooze.on .label{color:inherit; font-weight:600}
+.snooze .choices{display:flex; flex-wrap:wrap; gap:8px}
+.snooze button{margin-top:0}
+.snooze .error{flex-basis:100%; font-size:13px; color:var(--alert)}
+button:disabled{opacity:.5; cursor:default}
+
 .disclaimer{margin:14px 2px 0; font-size:13px; color:var(--faint)}
 
 .scroll{overflow-x:auto; -webkit-overflow-scrolling:touch; border:1px solid var(--rule);
@@ -1816,6 +2132,7 @@ button{font:inherit; font-size:13px; color:var(--ink); background:var(--card);
 .problems li{padding:8px 12px; border:1px solid var(--rule); border-left:3px solid var(--note-rule);
   border-radius:6px; background:var(--card); font-size:13px; overflow-wrap:anywhere}
 .problems li.error{border-left-color:var(--alert)}
+.problems li.resolved{border-left-color:var(--rule); color:var(--soft)}
 .problems .when{color:var(--faint); margin-right:8px}
 
 footer{margin-top:32px; font-size:13px; color:var(--faint)}
@@ -1866,6 +2183,11 @@ footer p{margin:4px 0}
       <dt>Brightness</dt><dd><div id="levels" class="levels"></div></dd>
     </dl>
   </section>
+  <div id="snooze" class="snooze hidden">
+    <span id="snooze-text" class="label"></span>
+    <div id="snooze-buttons" class="choices"></div>
+    <div id="snooze-error" class="error hidden" role="alert"></div>
+  </div>
   <p class="disclaimer">A convenience display, not an alarm. Keep your Dexcom app's alarms on.</p>
 
   <section id="problems-section" class="hidden">
@@ -1894,6 +2216,7 @@ const HISTORY_ROWS = 60;
 
 let boot = null, lastSeq = 0, cycles = [], problems = [], settings = null;
 let serverNow = 0, fetchedAt = 0, lastContact = 0, lost = false, showAll = false;
+let snoozeUntil = null, snoozeBusy = false, snoozeError = "", snoozeMode = null;
 
 const $ = id => document.getElementById(id);
 
@@ -1926,6 +2249,14 @@ function clock(t, seconds){
   return new Date(t * 1000).toLocaleTimeString([], opts);
 }
 
+// A clock time, with the date in front when it isn't today. Warnings stay
+// until a restart, and "16:38:24" from last week reads as this afternoon.
+function when(t){
+  const d = new Date(t * 1000);
+  if (d.toDateString() === new Date().toDateString()) return clock(t, true);
+  return d.toLocaleDateString([], {month:"short", day:"numeric"}) + " " + clock(t, false);
+}
+
 // Server time now, extrapolated from the last response with the browser's own
 // monotonic clock, so a phone whose clock is off can't make a reading look
 // fresher or older than it is.
@@ -1948,8 +2279,12 @@ async function poll(){
     boot = data.boot;
     settings = data.settings;
     problems = data.problems;
-    const grew = data.cycles.length > 0;
-    cycles.push(...data.cycles);
+    snoozeUntil = data.snooze_until;
+    // Filtered, because a snooze tap adds an extra poll that can overlap the
+    // regular one, and both would otherwise append the same new cycles.
+    const fresh = data.cycles.filter(c => c.seq > lastSeq);
+    const grew = fresh.length > 0;
+    cycles.push(...fresh);
     if (cycles.length > settings.history_size) cycles.splice(0, cycles.length - settings.history_size);
     if (cycles.length) lastSeq = cycles[cycles.length - 1].seq;
     serverNow = data.now;
@@ -1988,6 +2323,7 @@ function renderLive(){
   }
   $("view").classList.toggle("lost-view", lost);
   if (!settings) return;
+  renderSnooze();
 
   const c = cycles[cycles.length - 1];
   if (!c){
@@ -2012,12 +2348,21 @@ function renderLive(){
   // Same rule as the light: once the reading passes STALE_MINUTES it is not
   // shown as current, even if the next cycle hasn't happened yet.
   if (state === "on" && age >= staleSeconds) state = "stale-now";
+  // The snooze is read live and the cycle can be a poll old, so for a moment
+  // after a tap they disagree. Show the light as already off: it's about to
+  // be, and dark is the safe way to be wrong.
+  const snoozing = snoozeUntil !== null && snoozeUntil > serverClock();
+  if (state === "on" && snoozing) state = "snoozing-now";
+  if (state === "snoozed" && !snoozing) state = "snooze-over";
   const on = state === "on" && !lost;
 
   let label;
   if (state === "on") label = "Lights on";
   else if (state === "stale") label = "Stale — lights off";
   else if (state === "stale-now") label = "Stale — lights off at the next cycle";
+  else if (state === "snoozed") label = "Snoozed — lights off";
+  else if (state === "snoozing-now") label = "Snoozed — lights going off";
+  else if (state === "snooze-over") label = "Snooze over — lights coming back on";
   else label = "No reading yet — lights off";
   const stateNode = $("state");
   stateNode.replaceChildren(label);
@@ -2086,8 +2431,78 @@ function renderLive(){
     levels.append(row);
   }
 
-  document.title = (on ? num(c.value) + " " + (c.trend || "") : "off") + " · diabetes-light";
+  document.title = (on ? num(c.value) + " " + (c.trend || "") : snoozing ? "snoozed" : "off") +
+    " · diabetes-light";
   setIcon(on ? c.hex : null);
+}
+
+function snoozeLabel(minutes){
+  if (minutes < 60) return num(minutes) + " min";
+  const hours = minutes / 60;
+  return num(hours) + (hours === 1 ? " hour" : " hours");
+}
+
+function renderSnooze(){
+  const box = $("snooze");
+  if (!settings.snooze_choices || !settings.snooze_choices.length){
+    box.classList.add("hidden");
+    return;
+  }
+  box.classList.remove("hidden");
+  const left = snoozeUntil === null ? 0 : snoozeUntil - serverClock();
+  const mode = left > 0 ? "on" : "off";
+  box.classList.toggle("on", mode === "on");
+  // Grayed with the rest when contact is lost: a restart ends a snooze, so
+  // "snoozed" is only the last thing this page heard.
+  box.classList.toggle("lost", lost);
+  // Rebuilt only when the mode flips, not on every one-second render: a
+  // button replaced between touch-down and touch-up swallows the tap.
+  if (mode !== snoozeMode){
+    snoozeMode = mode;
+    const buttons = $("snooze-buttons");
+    buttons.replaceChildren();
+    const choices = mode === "on" ? [[0, "Turn the light back on"]]
+      : settings.snooze_choices.map(m => [m, snoozeLabel(m)]);
+    for (const [minutes, text] of choices){
+      const b = el("button", null, text);
+      b.type = "button";
+      b.addEventListener("click", () => requestSnooze(minutes));
+      buttons.append(b);
+    }
+  }
+  $("snooze-text").textContent = mode === "on"
+    ? "Snoozed until " + clock(snoozeUntil, false) + " · " + dur(left) + " left"
+    : "Snooze the light for";
+  for (const b of $("snooze-buttons").children) b.disabled = lost || snoozeBusy;
+  const error = $("snooze-error");
+  error.textContent = snoozeError;
+  error.classList.toggle("hidden", !snoozeError);
+}
+
+async function requestSnooze(minutes){
+  snoozeBusy = true;
+  snoozeError = "";
+  renderSnooze();
+  try {
+    const res = await fetch("snooze", {
+      method:"POST", cache:"no-store",
+      // The custom header is what the server checks to know this came from
+      // its own page; see the comment above do_POST.
+      headers:{"Content-Type":"application/json", "X-Diabetes-Light":"1"},
+      body:JSON.stringify({minutes}),
+    });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    snoozeUntil = (await res.json()).snooze_until;
+  } catch (err) {
+    snoozeError = minutes
+      ? "The snooze didn't go through, so the light is unchanged. Try again."
+      : "Couldn't turn the light back on. Try again.";
+  }
+  snoozeBusy = false;
+  renderLive();
+  // The loop runs a cycle as soon as the snooze changes. Fetch it once it
+  // has, rather than waiting up to a full poll to see the light follow.
+  setTimeout(poll, 2500);
 }
 
 function renderFreshness(age){
@@ -2151,6 +2566,7 @@ function renderHistory(){
     const flags = el("td");
     if (c.state === "on" && c.urgent) flags.append(el("span", "flag urgent", "URGENT LOW"));
     if (c.state === "stale") flags.append(el("span", "flag", "STALE"));
+    if (c.state === "snoozed") flags.append(el("span", "flag", "SNOOZED"));
     if (c.state === "waiting") flags.append(el("span", "flag", "no reading yet"));
     if (c.fetch_failed) flags.append((flags.childNodes.length ? " · " : "") + "Share fetch failed");
     tr.append(flags);
@@ -2166,8 +2582,8 @@ function renderProblems(){
   const list = $("problems");
   list.replaceChildren();
   for (const p of problems.slice().reverse()){
-    const li = el("li", p.level === "WARNING" ? null : "error");
-    li.append(el("span", "when num", clock(p.time, true)), p.message);
+    const li = el("li", p.resolved ? "resolved" : p.level === "WARNING" ? null : "error");
+    li.append(el("span", "when num", when(p.time)), p.message);
     list.append(li);
   }
 }

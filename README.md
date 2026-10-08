@@ -723,6 +723,20 @@ That means `err.log` staying empty is itself a health signal — if it has conte
 something needs attention, and you don't have to read past a thousand normal
 lines to find it.
 
+Blips don't count. Share drops the odd request and the bridge times out now
+and then, and nearly always the next cycle works. A failure is logged to
+**stdout** first, and only becomes a warning once it has lasted five minutes.
+Then you get one warning when it crosses that line, another if the error
+changes partway through, and one more when it clears:
+
+```
+10:06 WARNING Dexcom Share has been failing for 5 min (6 tries in a row). Could not fetch a reading from Dexcom Share: ...
+16:38 WARNING Dexcom Share is working again, after failing for 6h 37m.
+```
+
+Not being able to reach the bridge at all is reported once, as "The Hue
+bridge", rather than once per light per call.
+
 **journald does not keep them apart.** It gives stdout and stderr the same
 priority (info), so `journalctl -p warning` shows nothing at all — not even real
 errors. To get the empty-`err.log` signal on Linux, send the two streams to
@@ -834,8 +848,8 @@ or an always-docked machine is fine; anything you pick up is not.
 Everything the per-cycle log line says, as a web page you can open on your
 phone: the reading and its arrow, what the arrow shifted it to, how old it is,
 the colour and name sent to the bulbs, each room's brightness, and any urgent
-or stale flag. Below that, recent warnings (the things that would land in
-`err.log`) and the last 12 hours of cycles as a table.
+or stale flag. Below that, a snooze button, recent warnings (the things that
+would land in `err.log`) and the last 12 hours of cycles as a table.
 
 Turn it on in `diabetes_light.env` and restart the service:
 
@@ -859,7 +873,43 @@ It follows the light's rule: **when in doubt, dark.**
 - The history lives in memory, so a restart clears it. The page never shows a
   reading this run of the script didn't see.
 
-It's read-only and has no login. There is nothing on it you can change.
+It has no login. The only thing on it you can change is the snooze.
+
+### Snoozing the light
+
+For when the CGM is wrong and the light is telling the whole room about it.
+The classic case is a compression low at 3am: you've rolled onto the sensor,
+it reads 50, and the bedside lamp jumps to full-brightness magenta.
+
+Under the reading there's a row of buttons: **30 min**, **1 hour**,
+**2 hours**, **4 hours**. Tap one and every light goes **off** within a second
+or two. The page then shows when the snooze ends, with a button to turn the
+light back on early.
+
+- **It turns the lights off,** rather than dimming them. Off already means
+  "no reading you can trust", and that's what you're saying when you snooze.
+  You can rely on there being only one meaning for a dark light.
+- **It covers every room,** because it's about the data, not a room.
+- **It runs for the time you picked.** It doesn't end early when the reading
+  recovers. A sensor that's wrong tends to stay wrong for a while, and a light
+  that comes back at 72 and blazes again at 68 is exactly what you were trying
+  to stop. When the time is up, the light comes straight back showing the
+  current reading.
+- **Everything else carries on.** Readings are still fetched and logged, and
+  the watchdog still arms. The log line shows what the light would have been:
+
+  ```
+  Glucose  52 ↓  -10 -> 42  |   40s old          | #FF00A8 [magenta]      | SNOOZED until 03:34, lights off
+  ```
+
+- **A restart ends it.** The snooze lives in memory, like the history. It
+  can't run for more than 12 hours, whatever asks for it.
+
+Anyone who can open the page can snooze the light. With `tailscale serve`
+that means devices on your own tailnet; never put this page on
+`tailscale funnel` or anything else public. A page on some other website
+can't snooze it for you: the request needs a header that browsers only let
+this page send.
 
 ### HTTPS, and reaching it from your phone
 
@@ -1118,7 +1168,8 @@ your Dexcom alarms on. The light cannot tell you it's lying.
 - **Sensor change or warmup.** Same as above: light goes off for the warmup
   period, then comes back on its own. Not a fault.
 - **Bridge reboots or takes a firmware update.** Schedules survive. The script
-  logs connection errors and retries; no action needed.
+  retries every cycle; no action needed. If the bridge is gone for more than
+  five minutes, that's one warning in `err.log`, and another when it's back.
 - **You changed your Dexcom password.** Update `diabetes_light.env` and restart
   the service. Nothing else picks it up.
 
@@ -1191,7 +1242,7 @@ not.
 | Full brightness, no fade | Reading at or below `URGENT_BELOW` |
 | A colour a little ahead of your phone | The trend arrow shifts the reading before the colour is picked — see 5c |
 | Dimming | Data is getting old (past 6 min), fading 70% -> 10% |
-| Off | No reading you can trust — stale data, stopped readings, or the script itself is gone |
+| Off | No reading you can trust — stale data, stopped readings, the script itself is gone, or you snoozed it (7a) |
 
 ## When it breaks
 
@@ -1206,8 +1257,9 @@ not.
 - **Light stops responding** — the Go's physical button starts a built-in
   effect. The script clears effects on write, so it should recover next cycle.
 - **Light unreachable** — the Go runs on battery when unplugged and eventually
-  dies. Keep it plugged in. With several lights configured, one unreachable
-  light logs a warning to stderr and the others carry on.
+  dies. Keep it plugged in. With several lights configured, the others carry
+  on, and a light that's still failing after five minutes gets a warning in
+  `err.log`.
 - **Wrong colours after a while** — check the PC's clock and timezone. Reading
   age is computed against local time.
 - **Everything stops after an update** — Windows rebooted. Verify the service

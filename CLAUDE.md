@@ -40,7 +40,10 @@ Dexcom sensor -> phone -> Dexcom Share cloud -> this script -> Hue bridge (LAN)
   a daemon thread, serving one self-contained HTML page (`STATUS_PAGE`, at the
   bottom of the file) and `/status.json`. `Runner.tick()` hands a
   `StatusBoard` the same facts the log line prints, via `_report()`. HTTPS is
-  `tailscale serve` in front of it, never TLS in-process.
+  `tailscale serve` in front of it, never TLS in-process. Its one write is
+  `POST /snooze`, which sets a deadline on the Runner's `Snooze`.
+- **Failures:** Share and bridge failures go through `Trouble`, which holds
+  them back to INFO until they've lasted `WARN_AFTER_MINUTES`.
 
 ## Invariants — don't break these
 
@@ -81,6 +84,25 @@ light. It fails dark like the light does: it re-applies `STALE_MINUTES` between
 cycles (ageing on the server's clock, not the phone's), greys out when it
 loses contact, and flags a loop that has stopped cycling. It binds `127.0.0.1`
 only, with no flag to change that, because it serves health data with no auth.
+The snooze is the one exception to "read-only", and it only moves a deadline:
+what the lights do about it is decided in `tick()`. `POST /snooze` requires
+the `X-Diabetes-Light` header (a cross-site page can't send it without a CORS
+preflight, which this server never approves) and rejects any `Sec-Fetch-Site`
+other than `same-origin`. Keep both checks.
+
+**A snooze is off, for everyone, for a fixed time.** Snoozing says "this reading
+is wrong", which is what off already means, so it turns the lights off rather
+than inventing a dimmed or tinted look. It is global, like staleness. It does
+not end early when the reading recovers, because a wrong sensor hovering
+around `URGENT_BELOW` would flicker the light on and off. Staleness still
+outranks it (a stale cycle reports "stale", not "snoozed"), the watchdog arms
+as usual underneath, and it lives in memory so a restart ends it. It's capped
+at `SNOOZE_MAX_MINUTES` whatever asks for it.
+
+**Reading age comes from the clock, never from counting cycles.** A failed
+fetch ages the last reading as `now - last_good_stamp`. Adding `POLL_SECONDS`
+per cycle undercounted whenever a cycle ran long on timeouts, making old data
+look fresher than it was, and a snooze tap now runs cycles off-schedule.
 Warnings shown on it have the Hue app key and Dexcom password redacted (a
 failed v1 call's URL contains the key). Server values go into the DOM via
 `textContent` only. A busy port logs a warning and the lights carry on without
@@ -111,7 +133,11 @@ These have all bitten before:
 - **`min_dim_level` differs per bulb.** `HueBridge.dim_floor()` takes the
   strictest floor within a group, so nothing is asked to dim below what it can
   do — and a strict bulb in one room doesn't drag a warning onto another.
-- **One failing light must not stop the others.** Per-light calls catch and log.
+- **One failing light must not stop the others.** Per-light calls go through
+  `HueBridge._each_light`, which catches and reports each one to `Trouble`.
+  A `requests.ConnectionError` is the bridge's problem, so it goes under one
+  `"bridge"` key, not one per light. Anything else, a `ReadTimeout` included,
+  is filed under that light.
 
 ## Testing
 
@@ -138,13 +164,26 @@ brightness attributes works.
 
 For the status page, build a `Runner` with `HueBridge` stubbed out and
 `runner.dexcom` / `runner.connect_dexcom` replaced by fakes, attach a
-`StatusBoard`, call `tick()` a few times and `start_status_page()`. Check it at
-phone width in both colour schemes, and in the stale and lost-contact states.
+`StatusBoard` (pass it `runner.snooze` so the snooze controls appear), call
+`tick()` a few times and `start_status_page()`. Check it at phone width in
+both colour schemes, and in the stale, snoozed and lost-contact states.
+
+`Trouble` and `Snooze` both read `time.time()`, so swapping in a fake clock
+lets you test a six-hour outage or a snooze expiring without waiting.
 
 ## Logging
 
 Routine output to stdout, warnings and errors to stderr, no overlap. An empty
 error log is a health signal, so don't log routine things at WARNING.
+
+A failure that fixes itself on the next cycle is routine. Anything that can
+fail transiently, like a network call made every cycle, reports to `Trouble`
+with `failed()`/`ok()` and must not call `log.warning` itself. The first
+failure is INFO, a streak past `WARN_AFTER_MINUTES` is one WARNING, a change
+of exception type mid-streak is another, and recovery from a warned streak is
+a WARNING with `extra={"resolved": True}`, which the status page shows muted.
+One Oct 2026 network outage wrote ~2,000 lines to err.log before this
+existed. Config problems found at startup still warn straight away, once.
 
 The status page's HTTP server logs requests at DEBUG only. A request line at
 INFO would land on stdout between two cycle lines and break the columns.
